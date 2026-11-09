@@ -1,0 +1,23 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: logshipper-role
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: logshipper-rb
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: logshipper-sa
+    namespace: default
+roleRef:
+  kind: Role
+  name: logshipper-role
+  apiGroup: rbac.authorization.k8s.io
