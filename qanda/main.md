@@ -299,3 +299,41 @@ spec:
   - 3xx	Redirection перенаправление
   - 4xx	Client Error ошибка клиента
   - 5xx	Server Error — ошибка сервера
+
+---
+
+# Из каких компонентов состоит kubernetes?
+- Control plane (мозг. не запускает контейнеры)
+  - kube-apiserver — REST API, единая точка входа. Все компоненты общаются только через него. Authn, authz (RBAC), admission, валидация.
+  - etcd — KV-хранилище, источник правды. Кластерный (Raft), 3 или 5 узлов. Только apiserver общается с etcd напрямую.
+  - kube-scheduler — выбирает ноду для пода (affinity, taints, resources, topology) и делает Bind (spec.nodeName) через API.
+  - kube-controller-manager — один бинарь, много контроллеров: Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob, Node, Endpoint, PV, PVC, ServiceAccount и др. Реконсилируют desired vs actual.
+  - cloud-controller-manager — опционально. Интеграция с облаком: LB, маршруты, ноды.
+
+- Node components (на каждой ноде)
+  - kubelet — агент ноды. Watch'ит API на поды с его nodeName. Через CRI создаёт контейнеры, через CNI настраивает сеть, монтирует volumes, probes, репортит статус.
+  - kube-proxy — реализует Service на ноде: iptables/IPVS-правила (DNAT на поды). Режимы: iptables, IPVS, userspace (legacy). Обычно DaemonSet.
+  - container runtime — containerd, CRI-O. Реализует CRI. Через runc запускает контейнеры. Docker не используется с K8s 1.24.
+
+- Addons (не часть ядра, но почти всегда есть)
+  - CoreDNS — DNS для сервисов и подов (svc.ns.svc.cluster.local).
+  - CNI-плагин — сеть подов. Calico, Cilium, Flannel, Weave. Модели: overlay (VXLAN), routing (BGP), eBPF (Cilium).
+  - CSI-драйвер — хранилище. EBS, GCE PD, Ceph, NFS.
+  - Ingress Controller — ingress-nginx, Traefik, HAProxy. L7.
+  - metrics-server — для HPA и kubectl top.
+  - kube-state-metrics — метрики состояния объектов.
+  - cert-manager — TLS-сертификаты (оператор, не ядро).
+  - Prometheus, Grafana, Loki, Dashboard.
+
+- Service — это API-объект, не компонент
+  - Service — декларация «виртуальный IP + балансировка на поды».
+  - Реализуют: kube-proxy (iptables/IPVS), CNI (Cilium eBPF), Ingress/LB (для LoadBalancer).
+  - Service сам трафик не распределяет.
+
+---
+
+# Как работает Taint и toleration
+- taint вешается командой на ноду
+- Формат написания Taint key=value:Effect
+- Эффекты: NoSchedule (выселяет уже запущенные поды, которые не имеют соответствующей toleration), NoExecute (Выселяет уже запущенные поды без toleration и запрещает новые), PreferNoSchedule (планировщик будет пытаться разместить, но это не гарантрировано)
+- Если нужно разместить под - у него должен быть toleration. key, value, если нет value - operator: Exists, и соответствующий Effect
