@@ -333,7 +333,114 @@ spec:
 ---
 
 # Как работает Taint и toleration
-- taint вешается командой на ноду
-- Формат написания Taint key=value:Effect
-- Эффекты: NoSchedule (выселяет уже запущенные поды, которые не имеют соответствующей toleration), NoExecute (Выселяет уже запущенные поды без toleration и запрещает новые), PreferNoSchedule (планировщик будет пытаться разместить, но это не гарантрировано)
-- Если нужно разместить под - у него должен быть toleration. key, value, если нет value - operator: Exists, и соответствующий Effect
+- это «не пускай сюда поды без разрешения».
+- Формат: key=value:Effect
+- `kubectl taint nodes node1 gpu=true:NoSchedule`
+- Удалить: `kubectl taint nodes node1 gpu=true:NoSchedule-` (минус в конце!)
+- Эффекты:
+  - NoSchedule — не пускает новые, старые живут.
+  - PreferNoSchedule — старается не пускать, но если нет альтернативы — пустит.
+  - NoExecute — выселяет старые и не пускает новые.
+- Toleration (на поде)
+  - «Мне можно на ноде с таким taint».
+  - operator: Equal (default, с value) или Exists (любой value).
+  - effect: NoSchedule / PreferNoSchedule / NoExecute.
+  - tolerationSeconds — для NoExecute, сколько жить до выселения.
+- Toleration снимает запрет, но НЕ гарантирует размещение.
+- Обычно комбинируют: taint на ноде + toleration + nodeAffinity/nodeSelector.
+- Системные taint'ы
+  - node.kubernetes.io/not-ready:NoExecute
+  - node.kubernetes.io/unreachable:NoExecute
+  - node.kubernetes.io/memory-pressure:NoSchedule
+  - node.kubernetes.io/disk-pressure:NoSchedule
+  - node.kubernetes.io/pid-pressure:NoSchedule
+  - node.kubernetes.io/unschedulable:NoSchedule
+  - У подов по умолчанию toleration на not-ready/unreachable с tolerationSeconds: 300.
+- Taint vs Affinity
+  - Taint — нода → под (repel). Affinity — под → нода (attract).
+  - Taint + toleration — разрешить. Affinity/nodeSelector — притянуть.
+  - Часто комбинируют: taint выделяет ноду, toleration разрешает, affinity притягивает.
+
+---
+
+# Job
+- нужен для одноразового запуска
+- restartPolicy: (Never, OnFailure)
+- backoffLimit - количество попыток. по умолчанию 6
+- каждая следующая попытка с большим интервалом
+- ttlSecondsAfterFinished - после этого таймаута джоб (и соответственно под) будет удалён
+- completions: Сколько подов должны успешно завершиться, чтобы Job считался выполненным (по умолчанию 1).
+- parallelism: Максимальное количество подов, которые могут работать одновременно (по умолчанию 1).
+- activeDeadlineSeconds: Жёсткий лимит времени на выполнение всего Job. Если время истекло, Job останавливается и помечается как failed. Имеет приоритет над backoffLimit
+
+---
+
+# CronJob
+- для периодический джобов
+- successfulJobsHistoryLimit
+- failedJobsHistoryLimit
+- concurrencyPolicy: Определяет, что делать, если предыдущий запуск ещё не завершился, а наступило время нового:
+  - Allow (по умолчанию): Разрешает параллельные запуски.
+  - Forbid: Запрещает параллельные запуски, новый Job пропускается, если предыдущий ещё работает.
+  - Replace: Отменяет текущий Job и запускает новый.
+- startingDeadlineSeconds: Крайний срок (в секундах), в течение которого CronJob должен запуститься, если по какой-то причине пропустил своё время. Если опоздание больше этого значения, запуск считается пропущенным (failed) и не выполняется.
+- suspend: Флаг (boolean), который позволяет временно приостановить выполнение CronJob, не удаляя его. Уже запущенные Job продолжат работу. По умолчанию false.
+- timeZone: Часовой пояс для расписания (например, Europe/Moscow). Если не указан, используется часовой пояс, в котором работает kube-controller-manager
+
+---
+
+# Affinity
+- Виды:
+  - nodeAffinity — притянуть под к нодам по labels/полям.
+  - podAffinity — притянуть под к подам (на той же ноде/зоне/...).
+  - podAntiAffinity — отталкивать под от подов (не на той же ноде/зоне/...).
+- Уровни жёсткости:
+  - requiredDuringSchedulingIgnoredDuringExecution — жёстко, иначе Pending.
+  - preferredDuringSchedulingIgnoredDuringExecution — мягко, с weight 1-100, scheduler суммирует.
+  - IgnoredDuringExecution: если labels изменились после запуска — под не выселяется.
+- nodeAffinity
+  - nodeSelectorTerms: matchExpressions (In, NotIn, Exists, DoesNotExist, Gt, Lt) и matchFields (metadata.name).
+  - Проще: nodeSelector (map[string]string, точное совпадение) — частный случай.
+- podAffinity / podAntiAffinity
+  - labelSelector — какие поды искать.
+  - namespaceSelector — в каких namespace (по умолчанию только свой!).
+  - topologyKey — что значит «рядом»: kubernetes.io/hostname (нода), topology.kubernetes.io/zone (AZ), region, или любой label ноды.
+  - Без topologyKey не работает.
+
+---
+
+# topologySpreadConstraints
+-  способ управления распределением подов по доменам топологии (зонам, узлам, регионам). 
+- В отличие от podAntiAffinity, который работает как жёсткий запрет ("не более одного пода в домене"), topologySpreadConstraints позволяют гибко настраивать допустимую степень неравномерности через параметр maxSkew
+- maxSkew: Максимально допустимая разница в количестве подов между доменами. Обязательное поле. Например, при maxSkew: 1 и трёх зонах с 10 подами распределение может быть 4-3-3, но не 5-3-2.
+- whenUnsatisfiable: Определяет поведение, если распределение не может быть соблюдено:
+  - DoNotSchedule (жёсткое правило): Под останется в статусе Pending, пока не появится подходящий домен.
+  - ScheduleAnyway (мягкое правило): Планировщик разместит под, даже если это нарушит maxSkew, отдав предпочтение домену с наименьшим перекосом.
+- topologyKey: Ключ метки узла, который определяет домен топологии. Например, kubernetes.io/hostname (узел), topology.kubernetes.io/zone (зона доступности) или topology.kubernetes.io/region (регион).
+- labelSelector: Селектор, который определяет, какие поды учитываются при подсчёте для расчёта skew.
+- minDomains (опционально): Минимальное количество доменов, которое должно быть доступно для планирования. Если доступных доменов меньше, maxSkew будет считаться нарушенным.
+- nodeAffinityPolicy и nodeTaintsPolicy (опционально, Beta с v1.26): Определяют, следует ли учитывать при расчёте skew узлы, которые не проходят по nodeAffinity/nodeSelector пода или имеют taints, которые под не терпит. Значение Honor (по умолчанию) означает, что такие узлы не учитываются при подсчёте, что даёт более точную картину распределения.
+
+---
+
+# Kubernetes. Что такое зона доступности?
+- Изолированный ЦОД (или группа) внутри региона облака.
+- Обычно 3 AZ в регионе (минимум 2, бывает 4-6).
+- Между AZ — низкая задержка (<2 мс), но физическая изоляция.
+- Высокая доступность: реплики распределены, потеря AZ не роняет приложение.
+- SLA: 99.99% multi-AZ vs 99.9% single-AZ.
+- Защита от сбоя дата-центра (пожар, питание, сеть).
+- В Kubernetes
+  - K8s не управляет AZ, а знает через labels на нодах.
+  - Ставит cloud-controller-manager (облако) или вручную (bare-metal).
+  - Labels: topology.kubernetes.io/zone, topology.kubernetes.io/region, kubernetes.io/hostname.
+- Использование при планировании
+  - topologySpreadConstraints + topologyKey: topology.kubernetes.io/zone — равномерное распределение с maxSkew.
+  - podAntiAffinity + topologyKey: zone — «не более одного в AZ» (жёстко, блокирует scaling).
+  - nodeAffinity — «только в определённых AZ».
+  - volumeBindingMode: WaitForFirstConsumer для StatefulSet + PVC (EBS/GCE PD привязаны к AZ).
+- При падении AZ
+  - Ноды NotReady → taint unreachable:NoExecute (tolerationSeconds: 300).
+  - Поды выселяются через 5 мин, контроллер создаёт новые в доступных AZ.
+  - Stateful с PVC может застрять — volume привязан к зоне.
+  - LB перестаёт слать трафик на упавшие ноды.
