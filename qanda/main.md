@@ -474,3 +474,93 @@ spec:
   - Поды выселяются через 5 мин, контроллер создаёт новые в доступных AZ.
   - Stateful с PVC может застрять — volume привязан к зоне.
   - LB перестаёт слать трафик на упавшие ноды.
+
+---
+
+# ConfigMap
+- Namespaced-объект. Хранит неконфиденциальные данные: строки, конфиги, переменные окружения, целые файлы.
+- Не предназначен для секретов — они не шифруются, видны всем, у кого есть доступ к namespace.
+- Ограничение размера одного ConfigMap — **1 MiB** (лимит etcd на объект).
+- Может хранить несколько ключей: каждый ключ — либо строка, либо файл.
+- Как использовать в поде:
+  - Как переменные окружения
+  - Как файл в volume (mount)
+  - Как аргументы командной строки
+- Обновление ConfigMap
+  - Volume mount: kubelet периодически (по умолчанию ~1 мин, `--sync-frequency`) обновляет файлы в смонтированном volume. Приложение должно перечитывать файл (например, по SIGHUP или само).
+  - Env vars: не обновляются в запущенном поде. Нужен рестарт пода (`kubectl rollout restart`).
+  - `subPath`: если ConfigMap смонтирован через `subPath`, обновления **не приходят** вообще — известное ограничение. Лучше монтировать директорию, а не отдельный файл.
+  - Immutable ConfigMap (`immutable: true`) — нельзя менять, только удалить и создать. Плюс: меньше нагрузки на apiserver, безопаснее.
+
+---
+
+# Kubernetes. Secret (API объект)
+- Namespaced-объект, хранит конфиденциальные данные в виде key-value.
+- Данные в `data` — **base64-encoded** (не зашифрованы!).
+- Данные в `stringData` — plain text, K8s сам закодирует при сохранении (удобно для ручного создания, но не для Git).
+- Лимит размера одного Secret — **1 MiB** (как у ConfigMap, лимит etcd).
+- Может быть `immutable: true` — нельзя менять, только пересоздать.
+- Зачем нужен (отличие от ConfigMap)
+  - Семантическое разделение: Secret помечен как sensitive, ConfigMap — нет.
+  - Отдельный RBAC: можно дать доступ к ConfigMap, но не к Secret.
+  - **Encryption at rest** — Secret можно шифровать в etcd (ConfigMap — тоже, но обычно шифруют именно Secret).
+  - Поддержка TLS-сертификатов, docker registry credentials, service account tokens — через специализированные типы.
+  - Меньше риск случайно залогировать (хотя `kubectl describe` всё равно показывает ключи, а `kubectl get -o yaml` — base64).
+- Типы Secret
+  - **`Opaque`** — по умолчанию, произвольные key-value. Пароли, токены, ключи.
+  - **`kubernetes.io/service-account-token`** — токен для ServiceAccount (устаревает с 1.24, заменяется projected tokens).
+  - **`kubernetes.io/dockerconfigjson`** — credentials для Docker registry (`.dockerconfigjson`).
+  - **`kubernetes.io/dockercfg`** — legacy-формат для registry.
+  - **`kubernetes.io/basic-auth`** — пара `username`/`password`.
+  - **`kubernetes.io/ssh-auth`** — SSH-ключ (`ssh-privatekey`).
+  - **`kubernetes.io/tls`** — TLS-сертификат (`tls.crt`, `tls.key`).
+  - **`bootstrap.kubernetes.io/token`** — для bootstrap-токенов нод.
+  - Тип задаёт **валидацию полей** и поведение (например, `tls` требует `tls.crt` и `tls.key`).
+- Secret vs Vault / External Secrets Operator
+  - **External Secrets Operator** — синхронизирует секреты из Vault/AWS Secrets Manager/GCP Secret Manager в K8s Secret. Приложение работает с обычным Secret, но источник правды — внешний.
+  - **Sealed Secrets** — шифрует Secret так, чтобы можно было коммитить в Git; расшифровывается только в кластере.
+  - **SOPS + age/KMS** — шифрование файлов в Git, расшифровка на CI/в кластере.
+  - **Правило:** для прода с аудитом и ротацией — Vault/External Secrets. Для простых случаев — K8s Secret + encryption at rest + RBAC.
+
+---
+
+# Kubernetes. Downward API
+- Механизм передачи полей Pod'а и контейнера в работающий контейнер.
+- Два способа: переменные окружения (`env`) и файлы в томе (`downwardAPI`).
+- Не требует доступа к API-серверу или клиентской библиотеке.
+- Работает только с **ограниченным набором** полей (не любое поле Pod'а доступно).
+- Данные доступны только **своему** поду — нельзя через Downward API получить информацию о другом поде.
+- Зачем нужен
+  - Приложению нужно знать своё имя, namespace, IP, имя ноды — без обращения к API.
+  - Передать лимиты и requests CPU/памяти в приложение (например, для настройки JVM heap или GOMEMLIMIT).
+  - Снизить связность: код не зависит от Kubernetes API.
+  - Идентификатор пода для логирования/метрик (имя пода уникально в namespace).
+  - Передать аннотации/лейблы в приложение (например, версию, окружение).
+- Доступные поля (Pod-level, через `fieldRef`)
+  - `metadata.name` — имя пода.
+  - `metadata.namespace` — namespace пода.
+  - `metadata.uid` — уникальный ID пода.
+  - `metadata.annotations['<KEY>']` — значение конкретной аннотации.
+  - `metadata.labels['<KEY>']` — значение конкретного лейбла.
+  - `spec.serviceAccountName` — имя ServiceAccount (только как env).
+  - `spec.nodeName` — имя ноды, где запущен под (только как env).
+  - `status.hostIP` — основной IP ноды (только как env).
+  - `status.hostIPs` — dual-stack версия (только как env).
+  - `status.podIP` — основной IP пода (только как env).
+  - `status.podIPs` — dual-stack версия (только как env).
+  - `metadata.labels` (все лейблы) и `metadata.annotations` (все аннотации) — **только как файлы** в томе, не как env.
+- Доступные поля (Container-level, через resourceFieldRef)
+  - limits.cpu, requests.cpu
+  - limits.memory, requests.memory
+  - limits.hugepages-*, requests.hugepages-*
+  - limits.ephemeral-storage, requests.ephemeral-storage
+  - Если лимит не задан, kubelet подставляет максимально доступное значение (node allocatable).
+
+---
+
+# Kubernetes. Projected volume
+- Том, который «проецирует» несколько источников в одну директорию.
+- Задаётся через `volumes[].projected.sources[]`.
+- Каждый source — один из типов: `secret`, `configMap`, `downwardAPI`, `serviceAccountToken`, `clusterTrustBundle`.
+- Все файлы из всех источников оказываются в **одном** `mountPath`.
+- Namespaced-объект (как и обычный под), но сам том — часть Pod'а.
