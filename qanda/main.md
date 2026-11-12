@@ -50,10 +50,40 @@ spec:
 
 ---
 
-# kubernetes. Что такое PersistentVolume, PersistentVolumeClaim
-- PersistentVolume это том, на каком то хранилище, бывает разных типов
-- PersistentVolumeClaim это требование
-- PersistentVolume и PersistentVolumeClaim связываются администратором вручную или автоматически с помошью StorageClass
+# PV, PVC, StorageClass
+- PersistentVolume (PV)
+  - Cluster-scoped объект, реальное хранилище (EBS, NFS, Ceph, local, CSI).
+  - Не привязан к namespace.
+  - Создаётся статически (админом) или динамически (провижионером StorageClass).
+  - Поля: capacity, accessModes, reclaimPolicy, storageClassName, тип бэкенда.
+  - Access modes: RWO (один узел), ROX (много узлов, ro), RWX (много узлов, rw), RWOP (один под).
+  - Reclaim: Retain (данные остаются), Delete (удаляются), Recycle (deprecated).
+  - Статусы: Available, Bound, Released, Failed.
+- PersistentVolumeClaim (PVC)
+  - Namespaced объект, запрос на хранилище от пода.
+  - Поля: accessModes, resources.requests.storage, storageClassName, selector.
+  - Под монтирует PVC, не PV.
+  - Статусы: Pending, Bound, Lost.
+- Binding (связывание)
+  - Static: админ создаёт PV, K8s биндит подходящий PVC по capacity, accessModes, storageClassName, selector.
+  - Dynamic: админ создаёт StorageClass, провижионер создаёт PV при появлении PVC.
+- StorageClass
+  - Cluster-scoped, описывает класс хранилища и провижионер.
+  - provisioner: CSI-драйвер (ebs.csi.aws.com, efs.csi.aws.com, cephfs.csi.ceph.com).
+  - parameters: тип диска, IOPS, encrypted, fsType.
+  - reclaimPolicy: Delete или Retain.
+  - volumeBindingMode: Immediate или WaitForFirstConsumer.
+  - allowVolumeExpansion: true/false.
+  - Default StorageClass через аннотацию is-default-class.
+- volumeBindingMode
+  - Immediate: PV создаётся сразу, в случайной AZ → в multi-AZ под может не найти ноду.
+  - WaitForFirstConsumer: PV создаётся после планирования пода, в его AZ.
+  - Для EBS/GCE PD/local PV — ВСЕГДА WaitForFirstConsumer.
+  - Для NFS/EFS/CephFS (нет привязки к AZ) — можно Immediate.
+- StatefulSet
+  - volumeClaimTemplates — PVC на каждый под (data-web-0, data-web-1).
+  - PVC не удаляются при удалении пода.
+  - persistentVolumeClaimRetentionPolicy (1.27+) — управлять удалением.
 
 ---
 
