@@ -586,3 +586,198 @@ spec:
   - **Логи для sidecar** — приложение пишет логи в EmptyDir, sidecar (Fluent Bit, Filebeat) читает и отправляет в Loki/Elastic.
   - **Промежуточные данные** для init-контейнеров — init скачивает артефакт в EmptyDir, основной контейнер использует.
   - **tmpfs для чувствительных данных** — `medium: Memory` для данных, которые не должны попасть на диск (ключи, токены, временные пароли).
+
+---
+
+# Kubernetes. Annotations
+- Что это
+  - Key-value метаданные на объекте Kubernetes (Pod, Deployment, Service, Ingress, Node, и т.д.).
+  - **Не участвуют в селекторах** — нельзя выбрать объекты по аннотации через `kubectl get -l` или `selector` в Service/Deployment.
+  - Хранятся в `metadata.annotations` — map[string]string.
+  - Значения — **строки**, любые (JSON, YAML, base64, URL, числа как строки).
+  - Лимит: **256 KiB** суммарно на объект (включая labels и annotations), ключ — до 63 символов в name + опциональный префикс DNS.
+  - Кластер-scoped и namespaced объекты — у всех есть annotations.
+- Зачем нужны
+  - Передать инструкции **контроллерам и инструментам** (ingress, Prometheus, cert-manager, external-dns, Vault, CSI).
+  - Хранить метаданные, не участвующие в выборке: контакт владельца, тикет, ссылка на runbook, дата деплоя.
+  - Служебные метаданные от Kubernetes и инструментов (kubectl, ArgoCD, Helm, cloud-provider).
+  - Управлять поведением плагинов без изменения их кода (декларативно, через манифест).
+  - Хранить произвольные структуры (JSON) — в отличие от labels, где значения ограничены.
+- Annotations vs Labels
+  - **Labels** — для **идентификации и выборки**: `app=web`, `env=prod`, `version=1.2.3`. Участвуют в selectors, используются в Service, Deployment, NetworkPolicy, affinity.
+  - **Annotations** — для **метаданных и инструкций**: `nginx.ingress.kubernetes.io/rewrite-target`, `prometheus.io/scrape`. **Не участвуют в selectors**.
+  - Оба — key-value, но у labels **строгие ограничения** на значения (≤63 символа, `[a-z0-9A-Z-_.]`), у annotations — **свободный текст** (до 256 KiB суммарно).
+  - Правило: если по полю нужно **выбирать** — label. Если **передать информацию инструменту** — annotation.
+  - Частая ошибка: пытаться выбрать поды по annotation через `kubectl get -l` — не работает.
+
+---
+
+# hostPath
+
+- Что это
+  - Тип тома в `spec.volumes[]` пода, а **не** отдельный API-объект.
+  - Монтирует **путь с файловой системы ноды** внутрь контейнера.
+  - Pod привязан к ноде, на которой физически существует этот путь.
+  - Не является persistent storage в смысле «следует за подом при переносе на другую ноду» — данные остаются на **конкретной** ноде.
+  - Namespaced-объекта нет — это часть Pod spec.
+  - Может использоваться как backend для PV (`spec.hostPath`)
+
+- Привязка пода к ноде
+  - Мржно с помощью **`nodeSelector`** (простой случай) или **`nodeAffinity`** (гибкий) — «хочу на ноду X, где есть этот путь».
+  - Без привязки под может уехать на ноду, где пути нет → ошибка или создание пустой директории (`DirectoryOrCreate`).
+  - В managed-кластерах (EKS, GKE, AKS) hostPath часто **запрещён** или ограничен admission-политиками.
+
+- Зачем нужен (легитимные сценарии)
+  - **Системные компоненты**:
+    - **CNI-плагины** (Calico, Cilium, Flannel) — монтируют `/etc/cni/net.d`, `/opt/cni/bin`, `/var/run/netns` с ноды.
+    - **CSI-драйверы** (node-driver) — монтируют `/dev`, `/var/lib/kubelet`, `/var/lib/iscsi` и т.д.
+    - **kube-proxy** — доступ к `/run/xtables.lock`, iptables.
+    - **node-exporter** — `/proc`, `/sys`, `/` (readOnly).
+    - **Fluent Bit, Filebeat, Loki promtail** — `/var/log/pods`, `/var/lib/docker/containers`.
+    - **NVIDIA device plugin** — `/dev/nvidia*`.
+  - **Dev-среда** — быстро смонтировать локальную папку с кодом, конфиги, логи.
+  - **Однонодовые кластеры** (kind, minikube, k3s) — для тестов, чтения `/var/log`, `/etc/kubernetes`.
+  - **Специфичное железо** — доступ к `/dev/kvm` для virt-драйверов, `/dev/fuse` для fuse-монтирований.
+
+- Почему небезопасно
+  - **Побег из контейнера** — если смонтировать `/`, `/etc`, `/var/run/docker.sock`, `/proc`, злоумышленник получает доступ к хосту.
+  - **`/var/run/docker.sock`** — полный контроль над Docker на хосте = root на ноде.
+  - **`/etc`** — можно изменить `/etc/passwd`, `/etc/shadow`, kubelet-конфиг, — всё, что угодно.
+  - **`/dev`** — прямой доступ к дискам, можно смонтировать/записать в `/dev/sda`.
+  - **`/proc`** — утечка информации о процессах, возможность инъекции.
+  - **`/var/lib/kubelet`** — доступ к credentials kubelet, можно попытаться получить API-доступ.
+  - **`/root`** — SSH-ключи, токены, конфиги.
+  - **`/var/lib/docker`** — прямой доступ к образам, слоям, секретам.
+  - **`/sys`** — ядерные параметры, cgroups.
+  - **`/run/containerd/containerd.sock`** — аналог docker.sock для containerd.
+  - **CVE** — некоторые CVE (например, CVE-2021-25741 в subPath) связаны с манипуляцией путями.
+  - Итог: hostPath в руках злоумышленника = **compromise ноды и всех подов на ней**.
+
+- Как ограничивать (не запрещать)
+  - **Pod Security Standards (PSS)**:
+    - `baseline` — не запрещает hostPath, но ограничивает.
+    - `restricted` — **запрещает** hostPath.
+  - **OPA/Gatekeeper** — политика, разрешать hostPath только для определённых namespaces/путей/SA.
+  - **Kyverno** — политики в YAML, разрешать по whitelist
+  - **`allowedHostPaths`** в PodSecurityPolicy (legacy, удалён в K8s 1.25) — был whitelist путей.
+  - **`readOnly: true`** в `volumeMounts` — обязательно, если только чтение.
+  - **`allowedHostPaths`** — whitelist конкретных путей, не «всё».
+  - **Привязка к ноде** через `nodeSelector`/`nodeAffinity` — сужает область.
+  - **Отдельные namespaces** для системных компонентов (`kube-system`), а в прикладных — запрет.
+  - **RBAC** — не давать `create pods` тем, кто не должен использовать hostPath.
+  - **Admission webhooks** — свой webhook для сложных проверок.
+
+- hostPath в dev vs prod
+  - **Dev** — ок: kind, minikube, k3d, локальная разработка, монтирование кода, логов.
+  - **Prod** — **только для системных компонентов** (`kube-system`, CNI, CSI, node-exporter), с `readOnly`, whitelist путей, RBAC, admission-политикой.
+  - **Не для приложений** — для данных использовать PVC, для конфигов ConfigMap/Secret, для логов — stdout + сборщик.
+  - **Managed-кластеры** (EKS, GKE, AKS) — часто запрещают hostPath для прикладных подов или требуют PSS restricted.
+
+---
+
+# Kyverno
+
+- Что это
+  - Kubernetes-native policy engine: политики — это CRD (ClusterPolicy или Policy), описанные на YAML.
+  - Работает как динамический admission controller: получает AdmissionReview от API-сервера и применяет к запросу matching-политики.
+  - Не требует изучения Rego — политики выглядят как обычные Kubernetes-манифесты.
+  - Поддерживает CEL (Common Expression Language) для сложных выражений, но базовые политики пишутся паттернами.
+
+- Зачем нужен (задачи)
+  - **Guardrails для разработчиков**: запретить privileged-контейнеры, `:latest`, hostPath, отсутствие resource limits, запуск от root.
+  - **Автоматическая мутация**: добавить дефолтные labels, sidecar, tolerations, `imagePullPolicy: Always`, resource limits.
+  - **Генерация ресурсов**: автоматически создавать NetworkPolicy, PodDisruptionBudget, ResourceQuota, LimitRange для новых namespace.
+  - **Supply chain security**: проверять подписи образов (cosign, notation) и attestations перед допуском в кластер.
+  - **Очистка**: удалять старые ресурсы по TTL или расписанию (Cleanup Policy).
+  - **Аудит и отчётность**: PolicyReport с нарушениями для observability и compliance.
+
+- Режимы работы (Audit vs Enforce)
+  - **Audit** (по умолчанию): нарушения **не блокируются**, записываются в `PolicyReport` / `ClusterPolicyReport`. Используется для «мягкого» включения политики, чтобы увидеть, кого она затронет.
+  - **Enforce**: нарушения **блокируются** на admission. API-сервер возвращает ошибку, ресурс не создаётся.
+  - Рекомендуется: сначала выкатить политику в **Audit**, посмотреть отчёты, добавить исключения (PolicyException), потом переключить в **Enforce**.
+  - `validationFailureAction` задаётся на уровне правила или политики.
+
+- Типы правил (что умеет политика)
+  - **Validate**: проверить ресурс на соответствие паттерну или CEL-выражению. Пример: запретить `privileged: true`, `:latest`, отсутствие `resources.limits`.
+  - **Mutate**: изменить ресурс при admission или ретроактивно (mutate-existing). Пример: добавить labels, sidecar, дефолтные limits.
+  - **Generate**: создать новый ресурс на основе политики. Пример: NetworkPolicy, PDB, ResourceQuota для каждого нового namespace.
+  - **VerifyImages**: проверить подпись образа и attestations (cosign, notation, Notary).
+  - **Cleanup**: удалить ресурсы по TTL-лейблу (`cleanup.kyverno.io/ttl`) или по расписанию (DeletingPolicy).
+  - Каждое правило содержит `match` (какие ресурсы), опционально `exclude` (кого исключить) и одно из действий: `validate`, `mutate`, `generate`, `verifyImages`, `cleanup`.
+
+- Архитектура (контроллеры)
+  - **Admission Controller**: сердце Kyverno, обрабатывает AdmissionReview, вызывает движок политик.
+  - **Background Controller**: выполняет generate и mutate-existing для уже существующих ресурсов, реконсилит `UpdateRequests`.
+  - **Cleanup Controller**: удаляет ресурсы по TTL или расписанию.
+  - **Report Controller**: создаёт и обновляет `PolicyReport` / `ClusterPolicyReport` на основе admission и background scan.
+  - **Webhook Controller**: динамически настраивает admission- и mutating-webhook'и под установленные политики, чтобы не дёргать Kyverno для ресурсов, которые ни одна политика не матчит.
+  - **Cert Renewer**: обновляет TLS-сертификаты webhook'ов, хранящиеся в Secret.
+  - Поддерживает HA: несколько реплик контроллеров.
+
+- Политики: ClusterPolicy vs Policy
+  - **ClusterPolicy** — cluster-scoped, действует на весь кластер.
+  - **Policy** — namespaced, действует только в своём namespace.
+  - В новых версиях (1.14+) появились отдельные типы политик: `ValidatingPolicy`, `MutatingPolicy`, `GeneratingPolicy`, `ImageValidatingPolicy`, `DeletingPolicy`, построенные на CEL. `ClusterPolicy` с `validate`/`mutate`/`generate`/`verifyImages` постепенно уходит в deprecated (v1.19), но пока поддерживается для обратной совместимости.
+
+---
+
+# RBAC
+
+- Что это
+  - Механизм **авторизации** (не аутентификации) в Kubernetes.
+  - Определяет, какие **verbs** (get, list, create, delete...) субъект может применять к каким **resources** (pods, deployments...) в каких **apiGroups** и **namespaces**.
+  - Работает **после** аутентификации: сначала K8s узнаёт, кто ты (cert, token, OIDC), потом RBAC решает, что тебе можно.
+  - Default deny: **после аутентификации прав нет**, пока их явно не выдадут.
+  - Встроен в API-сервер, включается флагом `--authorization-mode=RBAC` (обычно вместе с Node, Webhook).
+  - Пользователи (users) **не являются объектами API** — они внешние (cert CN, OIDC subject, токен). А вот ServiceAccount — объект API.
+
+- Authentication vs Authorization — критично
+  - **Authentication** (кто ты): TLS-сертификат (CN = user), OIDC (Google, Keycloak, Dex), ServiceAccount JWT token, static token file, webhook.
+  - **Authorization** (что можно): RBAC, ABAC (legacy), Node (для kubelet), Webhook (внешний сервис, например OPA), AlwaysAllow/AlwaysDeny.
+  - **RBAC не аутентифицирует.** Сертификат — это аутентификация. RBAC лишь проверяет права уже аутентифицированного субъекта.
+  - Ошибки: **401 Unauthorized** — не аутентифицирован; **403 Forbidden** — аутентифицирован, но прав нет (RBAC запретил).
+
+- Основные объекты
+  - **Role** — namespaced, набор правил в **одном** namespace.
+  - **ClusterRole** — cluster-scoped, набор правил на **весь кластер** (или на cluster-scoped ресурсы: nodes, PV, namespaces, CRD).
+  - **RoleBinding** — namespaced, связывает Role (или ClusterRole) с субъектами **в своём namespace**.
+  - **ClusterRoleBinding** — cluster-scoped, связывает ClusterRole с субъектами **на весь кластер**.
+  - **Ключевой паттерн:** ClusterRole + RoleBinding = «права из ClusterRole, но только в одном namespace». Это часто используется, чтобы не дублировать Role в каждом namespace.
+
+- Subjects (кому выдаём)
+  - **User** — внешний пользователь, `name: "alice"` (из cert CN, OIDC `sub`).
+  - **Group** — группа, `name: "developers"` (из cert O, OIDC `groups`).
+  - **ServiceAccount** — `name: "ci-bot"`, `namespace: "ci"`.
+  - В `subjects` указывается `kind`, `name`, `apiGroup` (для User/Group — `rbac.authorization.k8s.io`, для SA — пусто), `namespace` (только для SA).
+  - Пользователи и группы **не создаются в K8s** — они приходят извне (cert, OIDC). K8s не хранит их как объекты.
+  - Группы **системные**:
+    - `system:authenticated` — все аутентифицированные.
+    - `system:unauthenticated` — неаутентифицированные (обычно без прав).
+    - `system:masters` — встроенная группа с полным доступом (cert с `O=system:masters` = cluster-admin).
+    - `system:serviceaccounts` — все SA кластера.
+    - `system:serviceaccounts:<ns>` — все SA в namespace.
+
+- Rules — из чего состоит правило
+  - **`apiGroups`** — группа API: `""` (core, **не** `v1`!), `apps`, `batch`, `networking.k8s.io`, `rbac.authorization.k8s.io` и т.д.
+  - **`resources`** — `pods`, `deployments`, `services`, `secrets`, `configmaps`, `nodes`, `persistentvolumes`, `customresourcedefinitions`...
+  - **`verbs`** — `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`, `deletecollection`.
+  - **`resourceNames`** — опционально, ограничить конкретными именами (например, только `configmap/global-config`). Не работает с `list`/`watch`/`create`.
+  - **`nonResourceURLs`** — для не-ресурсных эндпоинтов (`/healthz`, `/metrics`, `/logs`). Только в ClusterRole.
+
+---
+
+# ServiceAccounts
+- Что это:
+  - **Каждый под** получает токен SA (по умолчанию — `default` в своём namespace), если не отключено.
+  - **`default` SA** по умолчанию **не имеет прав** (кроме discovery). «Хватит default» — потому что он **ничего не может**, а не потому что «достаточно прав».
+  - **`automountServiceAccountToken: false`** — на Pod или SA, если под не обращается к API. Меньше поверхности атаки.
+  - Для пода, который **ходит в API** — создать отдельный SA, выдать Role/ClusterRole через Binding.
+  - **Projected token** (K8s 1.24+) — TTL, audience, bound to pod, ротация. Legacy Secret с токеном — устарел.
+  - ServiceAccount **не аутентифицируется сертификатом** — только JWT-токеном (projected или legacy Secret).
+  - Связывание с правами — **RoleBinding** (в namespace) или **ClusterRoleBinding** (на кластер). Не «только ClusterRoleBinding» — RoleBinding тоже работает, и это чаще правильнее.
+
+- Пользователи vs ServiceAccounts
+  - **Пользователь** — внешний субъект, не объект API. Аутентификация: cert (CN=user, O=group), OIDC, static token, webhook. Создать пользователя через `kubectl` **нельзя** — только выдать сертификат/настроить OIDC.
+  - **ServiceAccount** — объект API в namespace. Аутентификация: JWT token. Создаётся через `kubectl create sa`.
+  - **kubeconfig** для пользователя: cluster + user (cert/token) + context (namespace). Пользователь получает kubeconfig, а права — через Binding.
+  - **kubeconfig для SA** — можно сгенерировать (cluster + token + context), но лучше использовать projected token или `kubectl create token`.

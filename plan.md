@@ -3,6 +3,7 @@
 - разобрать Скилбокс
 - разобрать Слёрм
 - разобрать swfuse
+- пройтись заново по старым вопросам
 
 # linux
 - https://github.com/Swfuse/devops-interview/blob/main/interview.md
