@@ -36,7 +36,7 @@
 - Kong, основан на nginx, имеет много модулей
 
 # service mesh и istio
-- с помощью service mesch модно жно вынести балансировку, TLS, метрики, хелсчеки
+- с помощью service mesh можно вынести балансировку, TLS, метрики, хелсчеки
 - curcuit breaker: механизм отключающий сбоящие сервисы
 - для етого нужен прокси и в подавляющем случае это envoy (динамичный в отличии от nginx)
 - сервис меши: istio, linkerd, consul, traefik mesh, kuma, aws app mesh

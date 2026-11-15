@@ -1078,3 +1078,186 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - **Ingress**: аннотация `cert-manager.io/cluster-issuer` запускает автоматический выпуск для хостов Ingress. Это самый частый сценарий в веб-приложениях.
   - **Service Mesh (Istio, Linkerd, Cilium)**: для mTLS и короткоживущих сертификатов рабочих нагрузок (workload identity).
   - **API Gateway** и кастомные операторы — все интегрируются через стандартный Secret с TLS.
+
+---
+
+# Service Mesh и Istio
+
+- Что такое service mesh
+  - Инфраструктурный слой для управления service-to-service коммуникацией.
+  - Выносит из приложения: балансировку, mTLS, ретраи, таймауты, circuit breaking, rate limiting, метрики, трейсинг, health checks.
+  - Реализуется через **sidecar-прокси** рядом с каждым подом (обычно Envoy) + **control plane**, который раздаёт конфигурацию прокси.
+  - Приложение общается с localhost, прокси перехватывает трафик прозрачно (iptables, eBPF или userspace).
+  - Зачем: единообразная безопасность (mTLS по умолчанию), observability без изменений кода, управление трафиком (canary, blue/green, A/B) на уровне инфраструктуры.
+
+- Data plane vs Control plane
+  - **Data plane** — сами прокси (Envoy) в подах. Они обрабатывают трафик: маршрутизация, TLS, метрики, ретраи.
+  - **Control plane** — центральный компонент (istiod), который **раздаёт конфигурацию** прокси через **xDS API** (LDS, RDS, CDS, EDS, SDS). Прокси динамически подхватывают изменения, без рестарта.
+  - **Почему Envoy, а не nginx**: Envoy изначально проектировался под динамическую конфигурацию через xDS, поддерживает hot reload без разрыва соединений, L7-фильтры, богатую observability. nginx исторически более статичен (reload конфига — отдельный процесс, есть нюансы с long-lived соединениями).
+
+- Ключевые возможности
+  - **mTLS** — автоматическое шифрование между подами, ротация сертификатов (через Citadel/SDS).
+  - **Traffic management** — canary, blue/green, A/B, traffic mirroring (shadow), fault injection, retries, timeouts.
+  - **Circuit breaking** — «предохранитель»: если сервис отвечает ошибками или таймаутами, mesh перестаёт слать ему трафик на время, чтобы не копить очередь и не ронять соседей. Быстрый fail вместо долгого ожидания.
+  - **Observability** — метрики (Prometheus), трейсинг (Jaeger, Tempo), access-логи, Kiali (UI для topology).
+  - **Security** — mTLS, авторизация (AuthorizationPolicy), аутентификация (RequestAuthentication), JWT.
+  - **Load balancing** — round-robin, least-request, consistent hash, locality-aware (zone-aware), outlier detection.
+
+- Популярные service mesh
+  - **Istio** — самый богатый функционал, Envoy, свой control plane (istiod), CNCF. Не подходит для маленьких кластеров. Накладные расходы
+  - **Linkerd** — легче Istio, свой Rust-прокси (linkerd2-proxy), проще в эксплуатации, меньше функций, CNCF.
+  - **Consul Connect** (HashiCorp) — service mesh + service discovery, Envoy, интеграция с Vault.
+  - **Kuma** (Kong) — на Envoy, мульти-zone, CNCF.
+  - **Traefik Mesh** — проще, на Traefik.
+  - **Cilium Service Mesh** — на eBPF, без sidecar (или с sidecar опционально), часть CNI Cilium.
+  - **AWS App Mesh** — managed, Envoy, только AWS.
+  - **Open Service Mesh (OSM)** — Microsoft, Envoy, но проект фактически передан сообществу и менее активен.
+  - **Тренд**: sidecar-less (Cilium eBPF, Istio ambient mode) — меньше overhead.
+
+- Архитектура Istio — актуальная (1.5+)
+  - **istiod** — единый control plane. Внутри:
+    - **Pilot** — раздаёт конфигурацию маршрутизации и балансировки через xDS.
+    - **Citadel** — управление сертификатами для mTLS (выдача, ротация).
+    - **Galley** — валидация и обработка конфигурации (в основном исторически, часть функций ушла в istiod).
+    - **Mixer** — **удалён** с Istio 1.8, telemetry теперь в Envoy (WASM-фильтры).
+  - **Istio CNI** — опциональный плагин, настраивает iptables без привилегий в поде (вместо `istio-init`).
+  - **Ingress Gateway** — Envoy на входе в mesh (аналог Ingress Controller).
+  - **Egress Gateway** — Envoy на выходе из mesh (контроль исходящего трафика).
+  - **Sidecar (istio-proxy)** — Envoy-контейнер рядом с приложением.
+  - **istio-init** — init-контейнер, который настраивает iptables для перехвата трафика (или заменяется на Istio CNI).
+  - **Важно**: старые «Pilot, Citadel, Galley как отдельные поды» — **устаревшая архитектура** (до 1.5). Сейчас всё в одном `istiod`.
+
+- Как Istio внедряется в поды (sidecar injection)
+  - **Автоматическая инъекция** через mutating admission webhook: Istio смотрит на label namespace (`istio-injection=enabled`) или пода (`sidecar.istio.io/inject: "true"`).
+  - В под добавляется **два контейнера**:
+    - **`istio-init`** (init) — настраивает iptables, чтобы весь трафик шёл через sidecar. После этого завершается.
+    - **`istio-proxy`** (sidecar) — сам Envoy, работает всё время жизни пода.
+  - **Важно**: Envoy — **sidecar**, а не init. Init только подготавливает сеть.
+  - Альтернатива: **Istio CNI** — настраивает iptables на уровне ноды, без `istio-init` (полезно, если запрещены privileged init-контейнеры).
+  - **Ambient mode** (Istio 1.22+) — sidecar-less: ztunnel (L4) и waypoint proxy (L7) вместо sidecar в каждом поде. Меньше overhead, проще.
+
+- Установка Istio — варианты
+  - **`istioctl install`** — рекомендуемый способ. Делает **pre-check** (валидация кластера, версии K8s, конфликты), генерирует и применяет манифесты. Профили: `default`, `demo`, `minimal`, `ambient`, `empty`.
+  - **`istioctl manifest generate` + `kubectl apply`** — генерирует манифесты, применяет вручную. **Pre-check нет**.
+  - **Helm** — установка через чарты `istiod`, `istio-base`, `istio-ingressgateway`, `istio-egressgateway`. Гибко, но **pre-check нет**, нужно самому валидировать.
+  - **Istio Operator** — CRD `IstioOperator`, контроллер в кластере, работает с повышенными правами. Удобно для GitOps, но добавляет свой контроллер. В новых версиях **deprecated** в пользу `istioctl` + Helm.
+  - **Все варианты ставят компоненты в namespace `istio-system`** (по умолчанию).
+
+- Ручная инъекция sidecar (для отладки)
+  ```bash
+  istioctl kube-inject -f pod.yaml -o pod-injected.yaml
+  ```
+  - **Важно**: не `> pod.yaml` (затрёт исходник), а `-o` или другой файл.
+  - Обычно не нужно — работает автоматическая инъекция по label namespace.
+
+- Включение инъекции на namespace
+  ```bash
+  kubectl label namespace default istio-injection=enabled
+  ```
+  - После этого все новые поды в namespace получат sidecar.
+  - Существующие поды — только после пересоздания (`kubectl rollout restart`).
+  - Точечно на под: аннотация `sidecar.istio.io/inject: "true"` или `"false"` (отключить).
+  - В современных версиях также `istio.io/rev=<revision>` для canary-обновлений control plane.
+
+- Управление трафиком (Istio CRD)
+  - **VirtualService** — правила маршрутизации: host, path, headers, weights (canary), retries, timeouts, fault injection, mirroring.
+  - **DestinationRule** — политики для destination: load balancing, connection pool, outlier detection (circuit breaking), TLS mode (ISTIO_MUTUAL), subsets.
+  - **Gateway** — вход/выход трафика (L4/L6), порты, TLS, SNI.
+  - **ServiceEntry** — добавить внешний сервис в mesh (например, внешний API), чтобы применять policy.
+  - **Sidecar** — ограничить набор сервисов, которые видит прокси (производительность в больших кластерах).
+  - **AuthorizationPolicy** — L4/L7 авторизация (кто к кому может).
+  - **RequestAuthentication** — JWT-валидация.
+  - **PeerAuthentication** — режим mTLS (STRICT, PERMISSIVE, DISABLE).
+
+- Когда Istio, когда нет
+  - **Istio**: много сервисов (десятки-сотни), нужен mTLS, canary, observability, есть команда, которая будет поддерживать.
+  - **Linkerd**: нужен mTLS и базовые метрики, но проще и легче.
+  - **Cilium Service Mesh**: уже используют Cilium как CNI, хотят sidecar-less.
+  - **Без mesh**: мало сервисов, нет требований к mTLS, можно обойтись Ingress + Service + NetworkPolicy.
+
+- Короткий ответ на собеседовании
+  - Service mesh — это инфраструктурный слой, который выносит из приложений сетевые задачи: балансировку, mTLS, ретраи, circuit breaking, метрики, трейсинг. Реализуется через sidecar-прокси (обычно Envoy) в каждом поде и control plane, который раздаёт конфигурацию через xDS. Istio — самый функциональный mesh: control plane — **istiod** (внутри Pilot, Citadel, Galley — консолидированы с 1.5; Mixer удалён), data plane — Envoy как **sidecar-контейнер** `istio-proxy` (не init; init `istio-init` только настраивает iptables, или Istio CNI вместо него). Инъекция включается label namespace `istio-injection=enabled` или аннотацией пода. Traffic management — через VirtualService (маршрутизация, canary, retries) и DestinationRule (LB, outlier detection = circuit breaking, TLS). mTLS по умолчанию, сертификаты ротируются автоматически. Observability — Prometheus, Jaeger, Kiali. Установка: `istioctl install` (с pre-check, рекомендуется), Helm или `manifest generate` (без pre-check), Istio Operator (deprecated). Диагностика: `istioctl analyze`, `proxy-status`, `proxy-config`, Kiali. Overhead: +50–100 МБ RAM, +1–3 мс latency на sidecar; ambient mode (ztunnel + waypoint) уменьшает. Для маленьких кластеров mesh часто избыточен — Linkerd или Cilium Service Mesh проще.
+
+---
+
+# Kiali
+
+- Что это
+  - UI и валидатор конфигурации для Istio (и других mesh).
+  - Не хранит данные сам — читает из **Prometheus** (метрики), **Jaeger/Tempo/Zipkin** (трейсы), **Grafana** (дашборды), **Kubernetes API** (объекты).
+  - Показывает **топологию сервисов**: кто с кем общается, какие ошибки, latency, throughput.
+  - Health сервисов: error rate, request rate, latency — на основе метрик Istio (Envoy).
+  - **Валидация конфигурации**: находит ошибки в VirtualService, DestinationRule, Gateway (аналог `istioctl analyze`, но в UI).
+  - Показывает mTLS-статус между сервисами, какие политики применены.
+  - Может открывать дашборды **Grafana** и трейсы **Jaeger** прямо из UI (deep links).
+  - Установка: `istioctl dashboard kiali` или Helm-чарт `kiali-server`.
+  - Аутентификация: через токен ServiceAccount, OIDC, OpenShift, LDAP.
+  - **Не заменяет** Prometheus/Grafana/Jaeger — это **агрегатор и UI поверх них**.
+
+- Что показывает
+  - **Graph** — топология: nodes (сервисы, workloads, app), edges (трафик), с метриками на рёбрах (rps, error %, latency p50/p95/p99), mTLS-иконки.
+  - **Applications / Workloads / Services** — списки с health, error rate, latency, throughput.
+  - **Istio Config** — список VirtualService, DestinationRule, Gateway с валидацией: зелёный/жёлтый/красный.
+  - **Traffic** — детализация по конкретному сервису: входящий/исходящий трафик, кто вызывает, кого вызывает.
+  - **Workloads** — поды, их health, Envoy-конфигурация, логи.
+  - **Mesh** — общая картина: control plane, data plane, mTLS.
+  - **Validations** — все ошибки конфигурации в одном месте.
+  - **Deep links** — в Grafana (дашборды), Jaeger (трейсы), Prometheus (метрики).
+
+- Архитектура
+  - **Kiali server** — Go-приложение, читает из Prometheus, Kubernetes API, Jaeger, Grafana.
+  - **Kiali UI** — React SPA, общается с Kiali server.
+  - **Auth** — token, OIDC, openshift, anonymous (для dev).
+  - **Storage** — своего нет, всё из внешних источников.
+  - **Требует** Prometheus с метриками Istio (Envoy → Prometheus).
+  - **Требует** Jaeger/Tempo для трейсов (опционально — без них нет трейсов, но топология работает).
+
+- Как Kiali и Jaeger работают вместе
+  - **Kiali** читает метрики из **Prometheus** → строит топологию, health, error rate, latency.
+  - **Kiali** читает трейсы из **Jaeger** → при клике на ребро/сервис открывает трейсы, связанные с этим трафиком.
+  - **Jaeger** хранит спаны → UI показывает дерево запроса.
+  - **Grafana** — дашборды (метрики), Kiali даёт deep link.
+  - Цепочка: **Envoy → Prometheus (метрики) + Jaeger (спаны) → Kiali (UI) + Grafana (дашборды)**.
+  - **Без Jaeger** Kiali работает (топология, health, config validation), но нет трейсов.
+  - **Без Prometheus** Kiali не работает — метрики основа.
+
+---
+
+# Jaeger
+- Что это:
+  - **Распределённый трейсинг** (distributed tracing): показывает путь одного запроса через цепочку сервисов.
+  - CNCF graduated (изначально Uber, 2017).
+  - Реализация идей **Dapper** (Google) и **OpenTracing**.
+  - **С 2023** — Jaeger объединён с OpenTelemetry: Jaeger больше не развивает свои клиенты (jaeger-client), использует **OTel SDK** для инструментации. Jaeger остаётся **backend** и **UI** для трейсов.
+  - Собирает спаны от инструментированных приложений и от Envoy (Istio).
+
+- Ключевые понятия:
+  - **Span** — единица операции: один вызов, одна функция, один HTTP-запрос. Содержит: `trace_id`, `span_id`, `parent_span_id`, имя, start time, duration, tags (key-value), logs (events), status.
+  - **Trace** — коллекция спанов одного запроса, связанных через `parent_span_id`. Образует **дерево** (или DAG) — от корневого спана до листьев.
+  - **Context propagation** — передача `trace_id`/`span_id` между сервисами через заголовки: **W3C Trace Context** (`traceparent`, `tracestate`) — современный стандарт; **B3** (Zipkin) — старый, но всё ещё распространён; **Jaeger** (`uber-trace-id`) — legacy.
+  - **Sampling** — не все трейсы сохраняются (иначе объём взорвётся). Стратегии: probabilistic (1%), rate-limiting, adaptive (Jaeger adaptive sampling), tail-based (по результату — сохранить только ошибки/медленные).
+  - **Tags** — метаданные спана: `http.method`, `http.status_code`, `db.statement`, `peer.service`.
+  - **Logs** — события внутри спана (например, exception).
+
+- Архитектура (актуальная)
+  - **Jaeger Collector** — принимает спаны (по OTLP, Jaeger thrift, Zipkin), валидирует, пишет в storage.
+  - **Jaeger Query** — API и UI для чтения трейсов из storage.
+  - **Jaeger UI** — веб-интерфейс: поиск по trace_id, сервису, операции, тегам, длительности; просмотр дерева спанов, таймингов, tags, logs.
+  - **Storage** — **Elasticsearch/OpenSearch** (production), **Cassandra** (production), **Badger** (local/dev), **встроенная память** (только для тестов). **Не** хранит данные в самом Jaeger.
+  - **Agent** — **deprecated** с Jaeger 1.46+, удалён в 2.x; приложения шлют спаны напрямую в collector по OTLP.
+  - **Jaeger v2** (2024+) — построен на OpenTelemetry Collector: единый бинарь collector + query + UI, конфигурация через OTel Collector config.
+  - **Ingester** (Kafka-based) — для масштабирования, читает спаны из Kafka, пишет в storage.
+
+- Как работает с Istio
+  - Envoy sidecar **инструментирован** для трейсинга: генерирует спаны на каждый HTTP/gRPC-запрос, передаёт контекст через заголовки.
+  - Istio настраивается на отправку спанов в Jaeger (`meshConfig.defaultConfig.tracing`).
+  - Приложение **не обязано** быть инструментировано — Envoy даёт «чёрный ящик» трейсинг между сервисами. Но для **внутренних** операций приложения (БД, вызовы внутри) нужна инструментация через OTel SDK.
+  - **Sampling** задаётся в Istio: `pilot.traceSampling` (например, 1%).
+  - **Headers**: Istio поддерживает B3, W3C, Jaeger — настраивается через `meshConfig.defaultConfig.tracing`.
+
+- Zipkin, Jaeger, OpenTelemetry — как соотносятся
+  - **Zipkin** — старейший open-source трейсинг (Twitter, 2012, на идеях Dapper). Свой формат, свой UI, **B3** propagation. Сейчас менее активен, но всё ещё используется.
+  - **Jaeger** — Uber, 2017, CNCF. Изначально свой формат (thrift), свой UI, свой клиент. С 2023 — **backend для OTel**, свои клиенты deprecated.
+  - **OpenTelemetry (OTel)** — CNCF, объединение OpenTracing + OpenCensus (2019). **Стандарт** для инструментации, сбора и экспорта телеметрии (traces, metrics, logs). Не backend — SDK + Collector + протокол **OTLP**. Jaeger, Tempo, Zipkin, Datadog, New Relic — все принимают OTLP.
+  - **Тренд**: инструментировать через **OTel SDK**, отправлять по **OTLP** в backend (Jaeger, Tempo, Datadog). Jaeger-клиенты и OpenTracing — legacy.
+  - **Grafana Tempo** — альтернатива Jaeger от Grafana Labs: дешёвое хранение трейсов в object storage (S3), интегрируется с Grafana. Часто используется вместо Jaeger.
