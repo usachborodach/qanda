@@ -106,14 +106,59 @@ make deploy IMG=yourrepo/namespace-labeler:tag
 
 ---
 
-# Что такое iptables?
-- классический механизм фильтрации и обработки сетевых пакетов на уровне ядра Linux (L3/L4)
-- ещё широко используется, но в современных дистрибутивах заменяютт на nftables
-- помимо фильтрации умеет NAT, mangle, conntrack, маркировку, redirect, forwarding
-- состоит из 5 таблиц: raw, nat, filter, mangle,  security
-- и 5 цепочек: PREROUTING, POSTROUTING, INPUT, OUTPUT, FORWARD
-- можно создавать пользовательские цепочки
-- действия в правилах: ACCEPT, DROP, REJECT, LOG, RETURN, JUMP, SNAT, DNAT, MASQUERADE, REDIRECT, MARK, NOTRACK 
+# iptables
+
+- Что это:
+  - классическая userspace-утилита для управления правилами **netfilter** (фреймворк в ядре Linux), которые фильтруют, транслируют и модифицируют сетевые пакеты на уровнях L3/L4. 
+  - В современных дистрибутивах iptables заменяется на **nftables**, но `iptables-nft` — совместимый слой, и знание iptables всё ещё обязательно.
+
+- Три уровня иерархии (снизу вверх)
+  - **Правило (rule)** — одно условие + target (действие). Пример: «если tcp dport 22 → ACCEPT».
+  - **Цепочка (chain)** — упорядоченный список правил. Пакет идёт сверху вниз, срабатывает **первое совпавшее** правило, дальше target решает судьбу.
+  - **Таблица (table)** — набор цепочек, сгруппированных по функции: filter, nat, mangle, raw, security.
+  - **Хук (hook)** — точка в ядре (netfilter), где пакет встречается с iptables: PREROUTING, INPUT, FORWARD, OUTPUT, POSTROUTING.
+  - Таблица — это «столбец» (функция), цепочка — «строка» (точка пути). На пересечении — правила.
+
+- Пять таблиц (функции)
+  - **raw** — обход conntrack (target `NOTRACK`). Работает **до** отслеживания соединений.
+  - **mangle** — модификация заголовков: TTL, TOS, MARK, TCP MSS.
+  - **nat** — трансляция адресов/портов: SNAT, DNAT, MASQUERADE, REDIRECT.
+  - **filter** — фильтрация: ACCEPT, DROP, REJECT. **Дефолтная таблица**, если `-t` не указан.
+  - **security** — маркировка для SELinux (SECMARK).
+
+- Пять встроенных цепочек (точки пути)
+  - **PREROUTING** — пакет только пришёл на интерфейс, routing decision ещё не было.
+  - **INPUT** — пакет адресован локальной машине.
+  - **FORWARD** — пакет транзитный (не нам, но через нас).
+  - **OUTPUT** — пакет сгенерирован локально.
+  - **POSTROUTING** — пакет готов уйти с интерфейса, routing decision уже было.
+
+- Матрица: какие таблицы есть в каких цепочках
+  - **PREROUTING**: raw → mangle → nat
+  - **INPUT**: mangle → filter → security
+  - **FORWARD**: mangle → filter → security
+  - **OUTPUT**: raw → mangle → nat → filter → security
+  - **POSTROUTING**: mangle → nat
+  - Запомнить: `raw` — только там, где **до** conntrack (PREROUTING, OUTPUT). `nat` — только там, где меняются адреса (PREROUTING, OUTPUT, POSTROUTING). `filter` — только там, где решается судьба пакета (INPUT, FORWARD, OUTPUT). `mangle` — везде. `security` — INPUT, FORWARD, OUTPUT.
+
+- Путь пакета — как это работает вместе
+  - **Входящий пакет к локальной машине**: NIC → PREROUTING (raw→mangle→nat) → routing → INPUT (mangle→filter→security) → локальный процесс.
+  - **Транзитный пакет (forwarding)**: NIC → PREROUTING (raw→mangle→nat) → routing → FORWARD (mangle→filter→security) → POSTROUTING (mangle→nat) → NIC.
+  - **Локально сгенерированный пакет**: процесс → OUTPUT (raw→mangle→nat→filter→security) → POSTROUTING (mangle→nat) → NIC.
+  - На каждом хуке пакет проходит таблицы в фиксированном порядке, в каждой таблице — цепочку с этим именем, в цепочке — правила сверху вниз до первого совпадения.
+
+- Чем `raw` отличается от `INPUT` (частый вопрос)
+  - **`raw` — это таблица**, **`INPUT` — это цепочка**. Это **разные измерения**, их нельзя сравнивать напрямую.
+  - `raw` отвечает на вопрос «отслеживать ли соединение» (NOTRACK), работает **до** conntrack, есть только в PREROUTING и OUTPUT.
+  - `INPUT` — хук для пакетов, адресованных локальной машине. В нём обрабатываются таблицы mangle, filter, security, но **не raw** (её там нет).
+  - Аналогия: `raw` — «отдел ранней обработки», `INPUT` — «входная дверь». Отдел работает **до** двери, а не внутри неё.
+
+- Targets (действия в правилах)
+  - **Терминальные**: `ACCEPT` (пропустить), `DROP` (молча отбросить), `REJECT` (отбросить с ICMP/RST).
+  - **Не терминальные**: `LOG` (залогировать и продолжить), `MARK` (пометить), `NOTRACK` (в raw, отключить conntrack).
+  - **Переходы**: `JUMP` (`-j` в пользовательскую цепочку), `RETURN` (вернуться в предыдущую), `GOTO` (`-g` в другую встроенную).
+  - **NAT**: `SNAT`, `DNAT`, `MASQUERADE`, `REDIRECT`.
+  - **Политика цепочки** (`-P INPUT DROP`) — дефолтное действие, если ни одно правило не совпало. Не путать с правилом.
 
 ---
 
@@ -848,3 +893,144 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - **ServiceAccount** — объект API в namespace. Аутентификация: JWT token. Создаётся через `kubectl create sa`.
   - **kubeconfig** для пользователя: cluster + user (cert/token) + context (namespace). Пользователь получает kubeconfig, а права — через Binding.
   - **kubeconfig для SA** — можно сгенерировать (cluster + token + context), но лучше использовать projected token или `kubectl create token`.
+
+---
+
+# Kubernetes. Модель сети
+
+- Уровень 1: фундаментальная модель сети подов
+  - **Каждый под получает уникальный IP в кластере** — плоская сеть, без NAT между подами.
+  - **Все контейнеры внутри пода делят один network namespace** — один IP, один localhost, общий порт-спейс.
+  - **IP, который видит контейнер, — тот же, что видят другие поды** — нет NAT между подами, нет «внутреннего» и «внешнего» IP пода.
+  - Под может общаться с любым другим подом **напрямую по IP**, без NAT, даже если они на разных нодах.
+  - Это требование к CNI: **flat network** — все поды видят друг друга так, будто они в одной L2-сети.
+  - **Важно:** это модель, а не «магия». Реализуется CNI-плагином (overlay, routing, eBPF).
+
+- Уровень 2: как это реализовано в Linux
+  - **Каждый под работает в своём network namespace** — не каждый процесс, как в заметке, а именно **под** (точнее, sandbox-контейнер пода). Процессы внутри одного контейнера делят netns, контейнеры внутри пода тоже делят один netns.
+  - **pause-контейнер (sandbox)** — служебный контейнер в каждом поде, который **держит network namespace открытым**. Если контейнер приложения упадёт и перезапустится, netns останется, IP не поменяется. Pause создаётся kubelet'ом через CRI (containerd/CRI-O).
+  - **veth-пара** — виртуальный Ethernet-кабель: один конец в netns пода, другой — в netns хоста (или в bridge/overlay). Так под «подключается» к сети ноды.
+  - **Каждая нода получает свой CIDR** для подов (например, `10.244.1.0/24` на node-1, `10.244.2.0/24` на node-2). Под получает IP из диапазона своей ноды.
+  - **Маршрутизация между нодами** — задача CNI:
+    - **Overlay** (VXLAN, IP-in-IP) — пакет инкапсулируется, идёт по underlay-сети. Flannel (VXLAN), Calico (IP-in-IP), Weave.
+    - **Routing** (BGP) — ноды анонсируют CIDR друг другу, пакеты идут напрямую. Calico (BGP), Cilium (BGP).
+    - **eBPF** — Cilium, без iptables/kube-proxy для部分 сценариев.
+
+- Уровень 3: CNI (Container Network Interface)
+  - **CNI** — спецификация и набор плагинов, которые настраивают сеть пода: создают veth, назначают IP, настраивают маршруты, DNS.
+  - Kubelet вызывает CNI-плагин при создании/удалении пода.
+  - **Популярные CNI**:
+    - **Calico** — BGP или IP-in-IP, поддержка NetworkPolicy, eBPF-режим (Calico eBPF), часто choice для прода.
+    - **Cilium** — eBPF-based, L3/L4/L7 policy, observability (Hubble), замена kube-proxy, современный фаворит.
+    - **Flannel** — простой overlay (VXLAN), **не поддерживает NetworkPolicy**, хорош для простых кластеров.
+    - **Weave Net** — overlay, простой, но менее популярен сейчас.
+    - **Antrea** — на Open vSwitch, поддержка NetworkPolicy.
+    - **kubenet** — встроенный в kubelet, простой, но не для прода.
+  - **Flannel как DaemonSet** — да, обычно запускается как DaemonSet на каждой ноде, создаёт интерфейс `flannel.1` (VXLAN) или `cni0` (bridge).
+  - **Команда `kubectl describe configmaps kube-flannel-cfg -A`** — устаревшая, в современных версиях Flannel конфиг лежит иначе (в Secret/ConfigMap с другим именем, зависит от манифеста). В новых установках смотреть `kubectl -n kube-flannel get cm,secret`.
+  - **Не путать:** CNI — только про сеть **подов**. Service — отдельный механизм, реализуется kube-proxy или CNI (Cilium eBPF).
+
+- Уровень 4: NetworkPolicy (изоляция между подами)
+  - **NetworkPolicy** — API-объект, описывающий, **какие поды** могут общаться с какими (по labels, namespace, портам, CIDR).
+  - Работает **только на L3/L4** (IP, порт, протокол), не на L7.
+  - **Требует поддержки CNI**: если CNI не поддерживает — политики **игнорируются** (молча, без ошибок).
+  - **Flannel — не поддерживает** NetworkPolicy (в классическом виде).
+  - **Calico, Cilium, Antrea, Weave (частично) — поддерживают**.
+  - Default deny — если политика `podSelector: {}` с `policyTypes: [Ingress, Egress]` — все поды в namespace изолированы, пока не разрешено явно.
+  - NetworkPolicy **не заменяет** RBAC или authentication — это сетевая изоляция.
+
+- Уровень 5: Service — доступ к подам (внутри и снаружи)
+  - **Service** — стабильный виртуальный IP (ClusterIP) + DNS-имя + балансировка на набор подов по selector.
+  - **Реализуется kube-proxy** (или CNI): iptables/IPVS-правила на каждой ноде делают DNAT на поды.
+  - **kube-proxy modes**:
+    - **iptables** — default, правила iptables, O(n) при большом числе сервисов.
+    - **IPVS** — быстрее и масштабируемее на больших кластерах (O(1) lookup), но требует модулей ядра.
+    - **nftables** — новый режим (K8s 1.29+), замена iptables.
+    - **userspace** — legacy, не использовать.
+  - **Cilium может заменить kube-proxy** полностью (eBPF), без iptables/IPVS.
+
+- Уровень 6: типы Service
+  - **ClusterIP** (default) — виртуальный IP, доступен **только внутри кластера**. Не «ClusterApi», как в заметке — **ClusterIP**.
+  - **NodePort** — открывает порт (30000–32767) на **каждой ноде**, трафик `NodeIP:NodePort` → Service → поды. Обращаться по адресам нод. Обычно используется как база для LoadBalancer или для dev.
+  - **LoadBalancer** — облачный LB (AWS NLB/ALB, GCP LB, Azure LB), один внешний IP, трафик идёт на ноды → Service → поды. **Дороже** (каждый LB = деньги), cloud-controller-manager следит за нодами.
+  - **ExternalName** — DNS CNAME на внешний сервис, без проксирования.
+  - **Headless** (`clusterIP: None`) — без виртуального IP, DNS возвращает IP подов напрямую. Для StatefulSet, gRPC, когда нужен прямой доступ к конкретным подам.
+
+- Уровень 7: Ingress (L7-доступ снаружи)
+  - **Ingress — не тип Service**, а отдельный ресурс L7-маршрутизации (host/path → Service).
+  - Требует **Ingress Controller** (ingress-nginx, Traefik, HAProxy, ALB Ingress Controller).
+  - Обычно работает поверх **NodePort** или **LoadBalancer** Service самого контроллера.
+  - Даёт: TLS termination, host/path routing, rewrite, rate limit, auth (через аннотации).
+  - **Ingress ≠ LoadBalancer**: Ingress — правило L7, LoadBalancer — тип Service L4.
+
+- Уровень 8: доступ к отдельному поду для отладки
+  - **`kubectl port-forward`** — туннель с локальной машины на под/сервис через API-сервер, **минуя Service и CNI**.
+  - `kubectl port-forward service/myservice 10000:80` — локальный порт 10000 → Service → под.
+  - `kubectl port-forward pod/mypod 8080:80` — напрямую на под.
+  - Только для отладки, **не для прода** (нет HA, нет балансировки, туннель через apiserver).
+
+- Уровень 9: HostNetwork (особый случай)
+  - **`hostNetwork: true`** — под использует **network namespace ноды**, а не свой.
+  - Под видит IP ноды, порты ноды, может занять порт на внешнем интерфейсе ноды.
+  - Используется для системных компонентов: CNI, kube-proxy, node-exporter, ingress-nginx (в некоторых режимах).
+  - **Опасно для приложений**: конфликты портов, нет изоляции, под привязан к ноде.
+  - Альтернатива — `hostPort` (порт на ноде → под), но тоже не рекомендуется для приложений.
+
+---
+
+# Ingress
+
+- Что такое Ingress (важное различие)
+  - **Ingress — это API-объект** (YAML-правила): «host/path → Service». Сам по себе **ничего не делает**.
+  - **Ingress Controller** — это **реальный прокси** (nginx, Traefik, HAProxy, Envoy), который читает Ingress-объекты и настраивает себя под них.
+  - Без контроллера Ingress-объект — просто «мёртвый» YAML, никто его не исполняет.
+  - Есть стандартный **API `networking.k8s.io/v1`** и разные контроллеры: `ingress-nginx` (community, SIG Network), NGINX Ingress Controller (F5/NGINX Inc), Traefik, HAProxy, Kong, ALB Ingress Controller, Istio Gateway, Contour, Skipper.
+
+- Что умеет Ingress (L7)
+  - **Маршрутизация по host** — `example.com` → один Service, `api.example.com` → другой.
+  - **Маршрутизация по path** — `/api/*` → backend-api, `/static/*` → backend-static.
+  - **Path types**: `Exact` (точное совпадение), `Prefix` (по префиксу), `ImplementationSpecific` (зависит от контроллера — например, regex в nginx через аннотации).
+  - **TLS termination** — `spec.tls` + Secret с `tls.crt`/`tls.key`, HTTPS на Ingress, HTTP до пода (или re-encrypt).
+  - **Rewrite URL** — через аннотации контроллера (`nginx.ingress.kubernetes.io/rewrite-target`), скрыть префикс от пода.
+  - **Redirect** (HTTP → HTTPS, www → non-www), **CORS**, **rate limiting**, **auth** (basic, OAuth, JWT) — через аннотации или CRD контроллера.
+  - **Default backend** — catch-all для несовпавших запросов (404 или fallback).
+  - **Name-based virtual hosting** — много доменов на одном IP, через `Host`-заголовок и SNI.
+
+- Что Ingress **не** умеет
+  - **TCP/UDP** — Ingress только HTTP/HTTPS (L7). Для TCP/UDP — `Service type: LoadBalancer` или `NodePort`, или CRD контроллера (например, `TCPIngress` в Traefik, `configmap tcp-services` в ingress-nginx).
+  - **L4-балансировка** — это Service.
+  - **gRPC** — только через специальные аннотации контроллера (`grpc_pass` в nginx), не нативно.
+  - **WebSocket** — работает через Upgrade-заголовки, но требует настройки таймаутов.
+  - **mTLS** — через аннотации контроллера, не стандарт.
+  - **Сложная маршрутизация** (header, method, query, weight) — частично через аннотации, но это уже не стандарт Ingress.
+
+- Аннотации
+  - Стандарт Ingress — **минимальный**. Всё остальное — через **аннотации**, специфичные для контроллера.
+  - Примеры для `ingress-nginx`:
+    - `nginx.ingress.kubernetes.io/rewrite-target` — переписать путь.
+    - `nginx.ingress.kubernetes.io/ssl-redirect` — HTTP → HTTPS.
+    - `nginx.ingress.kubernetes.io/proxy-body-size` — размер тела.
+    - `nginx.ingress.kubernetes.io/limit-rps` — rate limit.
+    - `nginx.ingress.kubernetes.io/auth-type`, `auth-secret` — basic auth.
+    - `nginx.ingress.kubernetes.io/configuration-snippet` — вставить произвольный nginx-конфиг (мощно и опасно).
+    - `cert-manager.io/cluster-issuer` — авто-выпуск TLS через cert-manager.
+  - **Минус:** аннотации не переносимы между контроллерами — переезд с nginx на Traefik = переписать все аннотации.
+  - **Это одна из причин, почему появился Gateway API**.
+
+- Популярные Ingress Controllers
+  - **ingress-nginx** (community, Kubernetes SIG Network) — самый распространённый, на nginx. **Важно:** проект **объявлен deprecated**, поддержка до марта 2026 — планируется миграция на Gateway API или Ingress NGINX от F5. Это стоит знать на собеседовании в 2025–2026.
+  - **NGINX Ingress Controller** (F5/NGINX Inc) — коммерческая поддержка, NGINX Plus, HA, расширенные фичи. Платный.
+  - **Traefik** — Go, нативный для K8s/Docker, автообнаружение, ACME «из коробки», canary через `TraefikService` (weighted), middleware CRD. Хорош для динамических окружений.
+  - **HAProxy Ingress** — на HAProxy, быстрый, надёжный, меньше «фишечек», чем у nginx.
+  - **Kong** — на OpenResty (nginx + Lua), богатая экосистема плагинов (auth, rate limit, logging, transformations), API Gateway-функции. Тяжелее, но мощнее.
+  - **AWS Load Balancer Controller** — создаёт ALB/NLB по Ingress-объектам, нативный для AWS.
+  - **Contour** — на Envoy, поддержка HTTPProxy CRD (богаче стандартного Ingress).
+  - **Istio Gateway / VirtualService** — если уже есть service mesh, Ingress может быть заменён на Istio Gateway.
+  - **Skipper** (Zalando) — для сложной маршрутизации.
+  - **Cilium Ingress** — если Cilium как CNI, может быть Ingress-контроллером на eBPF.
+
+- Ingress vs Gateway API (современный тренд)
+  - **Ingress** — старый API, минимальный, всё через аннотации, не переносимо между контроллерами, нет TCP/UDP, нет сложной маршрутизации.
+  - **Gateway API** — новый стандарт (K8s SIG Network), **роли** ( infra provider / cluster operator / app developer), **типизированные** ресурсы (`GatewayClass`, `Gateway`, `HTTPRoute`, `TCPRoute`, `GRPCRoute`, `TLSRoute`), **переносимые** между контроллерами, поддержка L4/L7, header/method/query matching, weights, traffic splitting.
+  - **Gateway API — преемник Ingress**, в 2025–2026 активно мигрируют. `ingress-nginx` deprecated → миграция на Gateway API или Ingress NGINX (F5).
+  - На собеседовании 2025+ стоит упомянуть, что Ingress — legacy, а Gateway API — современный стандарт.
