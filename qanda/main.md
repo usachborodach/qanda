@@ -532,22 +532,62 @@ make deploy IMG=yourrepo/namespace-labeler:tag
 ---
 
 # Affinity
-- Виды:
+
+- Виды
   - nodeAffinity — притянуть под к нодам по labels/полям.
   - podAffinity — притянуть под к подам (на той же ноде/зоне/...).
   - podAntiAffinity — отталкивать под от подов (не на той же ноде/зоне/...).
-- Уровни жёсткости:
+  - Все три — часть `spec.affinity` пода, не отдельные API-объекты.
+
+- Уровни жёсткости
   - requiredDuringSchedulingIgnoredDuringExecution — жёстко, иначе Pending.
   - preferredDuringSchedulingIgnoredDuringExecution — мягко, с weight 1-100, scheduler суммирует.
   - IgnoredDuringExecution: если labels изменились после запуска — под не выселяется.
+  - **`weight`** — только у `preferred`, целое 1–100. Scheduler суммирует веса всех подходящих preferred-правил для каждой ноды и выбирает ноду с максимальной суммой. У `required` weight нет — либо правило выполнено, либо нет.
+  - **`IgnoredDuringExecution`** — важная часть названия: affinity проверяется **только в момент планирования**. Для выселения при изменении labels нужен taint `NoExecute`, а не affinity.
+  - **`requiredDuringSchedulingRequiredDuringExecution`** — обещан, но **не реализован** в K8s. Только `Ignored`.
+
 - nodeAffinity
   - nodeSelectorTerms: matchExpressions (In, NotIn, Exists, DoesNotExist, Gt, Lt) и matchFields (metadata.name).
   - Проще: nodeSelector (map[string]string, точное совпадение) — частный случай.
+  - **`matchExpressions`** — по labels ноды (`disktype`, `zone`, `gpu`).
+  - **`matchFields`** — по полям объекта ноды, чаще всего `metadata.name` (имя ноды). Полезно, когда нужно «только на конкретную ноду по имени».
+  - **`nodeSelectorTerms`** — OR между terms, **`matchExpressions` внутри term** — AND. То есть `(A AND B) OR (C AND D)`.
+  - **Операторы**:
+    - `In` — label входит в список значений.
+    - `NotIn` — label не входит.
+    - `Exists` — label существует (значение любое).
+    - `DoesNotExist` — label отсутствует.
+    - `Gt` / `Lt` — значение больше/меньше (для числовых строк).
+  - **`nodeSelector` vs `nodeAffinity`**: `nodeSelector` — простой map, точное совпадение, по факту `required` с одним `In`. `nodeAffinity` — операторы, `preferred`, `matchFields`. Если нужно только «хочу на ноду с `gpu=true`» — хватит `nodeSelector`.
+
 - podAffinity / podAntiAffinity
   - labelSelector — какие поды искать.
   - namespaceSelector — в каких namespace (по умолчанию только свой!).
   - topologyKey — что значит «рядом»: kubernetes.io/hostname (нода), topology.kubernetes.io/zone (AZ), region, или любой label ноды.
   - Без topologyKey не работает.
+  - **`labelSelector`** — `matchLabels` (map) или `matchExpressions` (операторы). Ищет поды по их labels.
+  - **`namespaceSelector`** — по умолчанию `podAffinity`/`antiAffinity` ищет **только в своём namespace**. Чтобы искать в других — указать `namespaceSelector: {}` (все namespace) или `namespaceSelector: {matchLabels: {env: prod}}`.
+  - **`topologyKey`** — обязателен. Определяет, что считать «рядом»:
+    - `kubernetes.io/hostname` — нода. «Не размещать два пода `app=web` на одной ноде».
+    - `topology.kubernetes.io/zone` — зона доступности. «Разные реплики в разных AZ».
+    - `topology.kubernetes.io/region` — регион.
+    - Любой label ноды — `rack`, `datacenter`, `gpu-type`.
+  - **`requiredDuringSchedulingIgnoredDuringExecution`** для anti-affinity — жёстко. **Проблема**: если реплик больше, чем доменов (нод/AZ), часть подов навсегда в `Pending`. Например, 4 реплики и 3 AZ с `required` anti-affinity → 4-я не запустится.
+  - **`preferredDuringSchedulingIgnoredDuringExecution`** для anti-affinity — мягко: «стараться не размещать рядом, но если нет альтернативы — разместить».
+  - **Производительность**: inter-pod affinity/anti-affinity — **дорогая операция** для scheduler'а. Для каждого пода-кандидата нужно проверить все поды в кластере (или в namespace). В больших кластерах (тысячи подов) замедляет планирование. Отсюда — `topologySpreadConstraints`.
+
+
+- Практическое правило — что использовать
+  | Задача | Инструмент |
+  |---|---|
+  | «Хочу на ноду с label `gpu=true`» | `nodeSelector` |
+  | «Хочу на SSD, но если нет — на HDD» | `nodeAffinity.preferred` |
+  | «Только на ноды в зоне `eu-west-1a`» | `nodeAffinity.required` + `topologyKey` |
+  | «Не размещать два пода `app=web` на одной ноде» | `podAntiAffinity.required` + `topologyKey: hostname` |
+  | «Стараться не размещать рядом, но можно» | `podAntiAffinity.preferred` |
+  | «Разные реплики в разных AZ» | `topologySpreadConstraints` (лучше) или `podAntiAffinity.required` + `topologyKey: zone` |
+  | «Под `app=cache` должен быть на той же ноде, что `app=web`» | `podAffinity.required` + `topologyKey: hostname` |
 
 ---
 
