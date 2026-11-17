@@ -1614,3 +1614,126 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - **Минусы**: высокий порог входа, **нет типов/валидации**, нет пакетирования/rollback.
   - **CUE** — «следующий шаг» с типами и валидацией.
   - **Для сложной генерации — Jsonnet**, для экосистемы — Helm, для простых overlay'ей — Kustomize.
+
+---
+
+# Kubernetes. Liveness, Readiness и Startup probes
+
+- Что это
+  - **Probes** — периодические проверки контейнера, которые выполняет **kubelet** на ноде (не control plane).
+  - Настраиваются **на каждый контейнер** в `spec.containers[].livenessProbe`, `readinessProbe`, `startupProbe`.
+  - Результат: `Success`, `Failure`, `Unknown`.
+  - Три типа проб решают **разные задачи** и по-разному влияют на под.
+
+- Способы проверки (mechanics)
+  - **`httpGet`** — GET-запрос на `path:port`. Успех — код **200–399**. Остальное — failure.
+  - **`tcpSocket`** — попытка TCP-соединения на `port`. Успех — соединение установлено.
+  - **`exec`** — выполнить команду **внутри** контейнера. Успех — exit code **0**.
+  - **`grpc`** — gRPC health check (K8s 1.23+ beta, 1.24 stable, `grpc_health_probe` или нативный gRPC health protocol).
+  - **Лучший выбор**: `httpGet` для HTTP-сервисов (просто, стандартно), `tcpSocket` для TCP-сервисов, `exec` для legacy/специфики, `grpc` для gRPC.
+  - **Не использовать `exec` с `curl`/`wget`**, если в образе их нет (distroless, scratch) — проба всегда будет падать.
+
+- Параметры проб (общие для всех трёх)
+  - **`initialDelaySeconds`** — сколько ждать перед **первой** проверкой. Default 0.
+  - **`periodSeconds`** — как часто проверять. Default 10.
+  - **`timeoutSeconds`** — таймаут одной проверки. Default 1.
+  - **`successThreshold`** — сколько успехов подряд нужно, чтобы считать «ок» после failure. Default 1. **Для liveness и startup всегда 1** (нельзя больше).
+  - **`failureThreshold`** — сколько неудач подряд, чтобы считать «провал». Default 3.
+  - **`terminationGracePeriodSeconds`** — при убийстве по liveness — сколько ждать graceful shutdown. Default 30.
+
+- Liveness probe — «жив ли»
+  - **Задача**: проверить, что процесс **не завис** (deadlock, бесконечный цикл, утечка, OOM-adjacent). Если процесс жив, но не отвечает — kubelet **убивает** контейнер (SIGTERM → grace → SIGKILL), и он перезапускается согласно `restartPolicy`.
+  - **Эффект failure**: контейнер **рестартится**. Под остаётся, IP не меняется (pause держит netns). Счётчик `RESTARTS` растёт.
+  - **`failureThreshold` × `periodSeconds`** — сколько времени процесс должен быть «мёртв», чтобы его убили. Например, 3 × 10s = 30 секунд.
+  - **Что проверять**: «отвечает ли event loop», «не завис ли главный поток», «жив ли процессор». **Не** зависимости (БД, внешние API) — иначе падение БД убивает все поды.
+  - **Классический пример**: HTTP `/healthz` возвращает 200, если приложение отвечает, и 500, если внутренний deadlock.
+  - **Антипаттерн**: liveness проверяет БД → БД упала → все поды в рестарт → каскадный сбой. Для зависимостей — readiness.
+
+- Readiness probe — «готов ли принимать трафик»
+  - **Задача**: проверить, что контейнер **готов обрабатывать запросы**. Пока не готов — **убирается из Endpoints** Service'а (kube-proxy перестаёт слать трафик), но **не убивается**.
+  - **Эффект failure**: под **не получает трафик** от Service, но продолжает работать. Когда проба снова успешна — возвращается в Endpoints.
+  - **Что проверять**: прогреты ли кэши, установлены ли соединения с БД, загружены ли конфиги, готов ли HTTP-сервер.
+  - **Классический пример**: приложение стартует 30 секунд, прогревает кэш → readiness `/ready` возвращает 200 только после прогрева.
+  - **Readiness + Service**: под без readiness-пробы считается готовым **сразу после запуска контейнера** — трафик может пойти на ещё не готовый под. Поэтому readiness нужна почти всегда.
+  - **Readiness и rolling update**: Deployment ждёт `Ready=true` перед удалением старого пода. Без readiness — трафик на неготовый под → 502/503.
+  - **Readiness и `minReadySeconds`**: под считается `Available` только через `minReadySeconds` после `Ready=true` — защита от «мигнувших» подов.
+
+- Startup probe — «запустился ли»
+  - **Задача**: дать приложению **время на старт**, не убивая его liveness-пробой. Пока startup не успешна — **liveness и readiness не выполняются**.
+  - **Эффект failure**: если startup не прошла за `failureThreshold × periodSeconds` — контейнер **убивается** (как liveness).
+  - **Эффект success**: startup больше **не выполняется**, начинают работать liveness и readiness.
+  - **Зачем**: для медленно стартующих приложений (JVM, .NET, большие миграции, ML-модели) — иначе liveness убьёт контейнер до того, как он успел запуститься.
+  - **Альтернатива без startup**: увеличить `initialDelaySeconds` у liveness — но это «костыль»: если приложение стартует быстрее, зря ждём; если медленнее — убьёт.
+  - **Параметры**: `failureThreshold` × `periodSeconds` = максимальное время на старт. Например, 30 × 10s = 5 минут.
+  - **K8s 1.18+** — stable.
+
+- Как они работают вместе
+  ```
+  Контейнер запущен
+      │
+      ▼
+  startup probe (если задана) ── failure ──► kill, restart
+      │ success
+      ▼
+  liveness + readiness (параллельно)
+      │
+      ├── liveness failure ──► kill, restart
+      │
+      └── readiness failure ──► убрать из Endpoints (не убивать)
+  ```
+  - **Startup** — «гейт» перед liveness/readiness.
+  - **Liveness** — «не завис ли».
+  - **Readiness** — «можно ли слать трафик».
+  - **Все три могут быть на одном контейнере** — обычно так и делают для критичных сервисов.
+
+- Типичные сценарии
+  - **Медленный старт (JVM, .NET)**: `startupProbe` с большим `failureThreshold` (например, 5 минут), `livenessProbe` с `periodSeconds: 10`, `readinessProbe` с проверкой прогрева.
+  - **HTTP-сервис**: `readinessProbe` на `/ready` (проверяет зависимости), `livenessProbe` на `/healthz` (только процесс).
+  - **База данных**: `tcpSocket` на порт, `livenessProbe` не должен трогать репликацию.
+  - **Worker без HTTP**: `exec` на проверку heartbeat-файла или `tcpSocket` на метрики-порт.
+  - **gRPC-сервис**: `grpc` probe на health-сервис.
+  - **Batch/Job**: probes обычно не нужны (Job не перезапускается по liveness так же).
+
+- Типичные ошибки и подводные камни
+  - **Liveness проверяет зависимости** (БД, API) → падение зависимости убивает все поды → каскад. **Readiness** — для зависимостей, **liveness** — только «жив ли процесс».
+  - **Нет readiness** → трафик идёт на неготовый под → 502/503 при старте и rolling update.
+  - **Readiness и liveness на одном endpoint** → при проблеме с зависимостью под выпадает из Endpoints **и** убивается — двойной удар.
+  - **`initialDelaySeconds` вместо `startupProbe`** → либо зря ждём, либо убиваем медленный старт. Для медленных — startup.
+  - **`successThreshold > 1` для liveness** → ошибка валидации (для liveness и startup всегда 1).
+  - **`exec` probe с `curl` в distroless/scratch** → curl нет, проба всегда падает, контейнер в рестарт-лупе.
+  - **Слишком агрессивные параметры** (`periodSeconds: 1`, `failureThreshold: 1`) → ложные срабатывания, рестарты на ровном месте.
+  - **Слишком мягкие параметры** (`periodSeconds: 60`, `failureThreshold: 5`) → 5 минут на обнаружение зависания, долгий простой.
+  - **Readiness без `minReadySeconds`** → под может «мигнуть» и получить трафик, не успев прогреться.
+  - **Probes не учитывают `terminationGracePeriodSeconds`** → при liveness-kill контейнер может не успеть graceful shutdown, если grace маленький.
+  - **`startupProbe` без `livenessProbe`** → если приложение зависло после старта, никто не заметит.
+  - **HTTP probe на `/`** → может вернуть 200, даже если приложение не готово (лендинг). Лучше отдельный `/healthz`/`/ready`.
+  - **Probe на порт, который слушает только localhost** → `httpGet` идёт с ноды, не с localhost, может не достучаться.
+  - **`timeoutSeconds: 1` по умолчанию** → для медленных проверок (БД-пинг) может ложно падать, увеличить.
+
+- Probes и Service / Deployment
+  - **Service** использует **readiness** для Endpoints. Liveness на Service не влияет.
+  - **Deployment rolling update** ждёт `Ready=true` (readiness) перед удалением старого пода. Без readiness — downtime.
+  - **`minReadySeconds`** — под считается `Available` через N секунд после `Ready`. Защита от «мигнувших» подов.
+  - **`progressDeadlineSeconds`** — если rollout не прогрессирует (readiness не проходит), Deployment помечается failed.
+  - **HPA** учитывает `Ready` поды для масштабирования.
+
+- Probes vs другие механизмы
+  - **Probes** — проверка состояния контейнера kubelet'ом.
+  - **`preStop` hook** — действие **перед** остановкой контейнера (graceful shutdown).
+  - **`postStart` hook** — действие **после** старта контейнера (но до readiness).
+  - **`terminationGracePeriodSeconds`** — сколько ждать graceful shutdown после SIGTERM.
+  - **`minReadySeconds`** — задержка перед `Available`.
+  - **`PodDisruptionBudget`** — сколько подов можно вывести при drain/eviction.
+
+- Частые вопросы на собеседовании
+  - **«Liveness vs readiness?»** — Liveness убивает и перезапускает контейнер, если процесс завис. Readiness убирает под из Endpoints, если он не готов принимать трафик, но не убивает.
+  - **«Зачем startup probe?»** — Для медленно стартующих приложений: даёт время на старт, не убивая liveness'ом. После успеха больше не выполняется.
+  - **«Что будет, если liveness упадёт?»** — kubelet убьёт контейнер (SIGTERM → grace → SIGKILL), контейнер перезапустится по `restartPolicy`. Под остаётся, IP не меняется.
+  - **«Что будет, если readiness упадёт?»** — Под убирается из Endpoints Service'а, трафик не идёт, но контейнер живёт. Когда readiness снова успешна — возвращается.
+  - **«Почему liveness не должен проверять БД?»** — Падение БД → все поды в рестарт → каскадный сбой. Для зависимостей — readiness.
+  - **«Можно ли задать `successThreshold > 1` для liveness?»** — Нет, для liveness и startup всегда 1. Для readiness — можно.
+  - **«Что такое `minReadySeconds`?»** — Под считается `Available` через N секунд после `Ready=true` — защита от «мигнувших» подов.
+  - **«Как probes влияют на rolling update?»** — Deployment ждёт `Ready=true` (readiness) перед удалением старого пода. Без readiness — downtime.
+  - **«`exec` probe в distroless — проблема?»** — Да, `curl`/`wget` нет, проба падает, контейнер в рестарт-лупе. Использовать `httpGet`/`tcpSocket` или бинарь health-check в образе.
+  - **«`initialDelaySeconds` vs `startupProbe`?»** — `initialDelaySeconds` — фиксированная задержка, «костыль». `startupProbe` — гибкий гейт: пока не стартовал, liveness не выполняется; как только стартовал — сразу работает.
+  - **«Можно ли probes на gRPC?»** — Да, `grpc` probe (K8s 1.24+ stable).
