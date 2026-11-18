@@ -1737,3 +1737,104 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - **«`exec` probe в distroless — проблема?»** — Да, `curl`/`wget` нет, проба падает, контейнер в рестарт-лупе. Использовать `httpGet`/`tcpSocket` или бинарь health-check в образе.
   - **«`initialDelaySeconds` vs `startupProbe`?»** — `initialDelaySeconds` — фиксированная задержка, «костыль». `startupProbe` — гибкий гейт: пока не стартовал, liveness не выполняется; как только стартовал — сразу работает.
   - **«Можно ли probes на gRPC?»** — Да, `grpc` probe (K8s 1.24+ stable).
+
+---
+
+# 3-way handshake (трёхстороннее рукопожатие TCP)
+
+- Что это
+  - Процесс установки TCP-соединения: три пакета, три шага.
+  - Цель — **синхронизировать ISN** (Initial Sequence Number) обеих сторон и согласовать параметры.
+  - Гарантирует, что **обе стороны живы** и могут отправлять/принимать.
+  - Происходит **до** передачи данных, на уровне L4 (TCP), поверх IP.
+  - В отличие от UDP, где соединения нет, TCP устанавливает состояние на обеих сторонах.
+
+- Три шага
+  - **Шаг 1: SYN (клиент → сервер)**
+    - Клиент отправляет пакет с флагом **SYN=1**, случайным **ISN (seq=x)**, опциями (MSS, window scaling, SACK permitted, timestamps).
+    - Клиент переходит в состояние **SYN_SENT**.
+    - «Я хочу открыть соединение, мой начальный sequence number — x».
+  - **Шаг 2: SYN-ACK (сервер → клиент)**
+    - Сервер отвечает пакетом с флагами **SYN=1, ACK=1**, своим **ISN (seq=y)** и **ack=x+1** (подтверждает ISN клиента).
+    - Сервер переходит в состояние **SYN_RECV**.
+    - «Согласен, мой начальный sequence number — y, твой x я подтвердил».
+  - **Шаг 3: ACK (клиент → сервер)**
+    - Клиент отправляет пакет с **ACK=1**, **ack=y+1**, **seq=x+1**.
+    - Клиент переходит в **ESTABLISHED**, сервер тоже — в **ESTABLISHED**.
+    - «Твой y подтверждён, соединение установлено».
+  - После третьего шага обе стороны могут передавать данные.
+
+- Состояния на сторонах
+  | Шаг | Клиент | Сервер |
+  |---|---|---|
+  | До | CLOSED | LISTEN |
+  | После SYN | SYN_SENT | SYN_RECV |
+  | После SYN-ACK | SYN_SENT → ESTABLISHED (после ACK) | SYN_RECV |
+  | После ACK | ESTABLISHED | ESTABLISHED |
+  - Видно в `ss -tan` / `netstat -tan`: `SYN-SENT`, `SYN-RECV`, `ESTABLISHED`.
+  - **Half-open connection** — состояние `SYN_RECV` на сервере, если клиент не прислал ACK (например, SYN flood).
+
+- Sequence numbers — зачем и почему случайные
+  - **ISN** — начальный номер последовательности байтов. Каждый следующий байт увеличивает seq на 1.
+  - **Случайность ISN** (RFC 6528) — защита от **TCP spoofing** и **TCP sequence prediction attacks**: если ISN предсказуем, атакующий может подделать пакеты и вклиниться в соединение.
+  - **`ack=x+1`** — подтверждение получения байта x; следующий ожидаемый — x+1.
+  - **SYN сам занимает один sequence number** (поэтому +1 в ack), хотя данных не несёт.
+
+- Что согласуется в handshake (TCP options)
+  - **MSS (Maximum Segment Size)** — максимальный размер данных в сегменте (без заголовков). Обычно MTU − 40 (IPv4) или − 60 (IPv6). Влияет на фрагментацию.
+  - **Window scaling** (RFC 1323) — множитель для receive window, позволяет окна > 64 КБ (нужно для high-BDP сетей).
+  - **SACK permitted** — Selective ACK: подтверждать не только «до», но и отдельные пропуски, ускоряет retransmission.
+  - **Timestamps** — для RTT-измерений и защиты от **PAWS** (Protection Against Wrapped Sequences).
+  - **TFO (TCP Fast Open)** — данные в SYN (опционально, редко включено).
+  - Если стороны не поддерживают опцию — она не используется.
+
+- Симметрия: 4-way termination
+  - Закрытие требует **четырёх** шагов, потому что TCP — **полудуплексный** на уровне закрытия: каждая сторона закрывает своё направление отдельно.
+  - **FIN → ACK → FIN → ACK**.
+  - Инициатор после FIN переходит в **FIN_WAIT_1**, потом **FIN_WAIT_2**; получатель — в **CLOSE_WAIT**, потом **LAST_ACK**.
+  - Инициатор после последнего ACK — в **TIME_WAIT** (2×MSL, обычно 60 секунд), чтобы запоздавшие пакеты старого соединения не попали в новое.
+  - **Half-close**: можно закрыть только запись (`shutdown(SHUT_WR)`), оставив чтение — тогда FIN в одну сторону, ACK, а вторая сторона ещё передаёт данные.
+
+- Атаки и защита
+  - **SYN flood** — атакующий шлёт много SYN с поддельных IP, сервер отвечает SYN-ACK, держит half-open соединения в `SYN_RECV`, таблица переполняется, легитимные клиенты не могут подключиться (DoS).
+  - **SYN cookies** — защита: сервер не хранит состояние для SYN, а кодирует его в ISN (hash от IP/порт/времени). При ACK восстанавливает состояние. Включается `net.ipv4.tcp_syncookies=1` (обычно включено по умолчанию).
+  - **`tcp_max_syn_backlog`** — размер очереди half-open соединений.
+  - **`somaxconn`** — размер очереди accept (полностью установленных, ждущих `accept()`).
+  - **TCP spoofing / sequence prediction** — защита: случайный ISN, SYN cookies, TLS.
+  - **Land attack** — SYN с src=src=dst, защита в современных ядрах.
+  - **SYN-ACK flood** — реже, защита через rate limiting / firewall.
+
+- 3-way handshake vs TLS handshake
+  - **TCP 3-way handshake** — установка транспортного соединения (L4), 1 RTT.
+  - **TLS handshake** — установка криптографического соединения (L5–7) **поверх** TCP: TLS 1.2 — 2 RTT, TLS 1.3 — 1 RTT (или 0-RTT при resumption).
+  - Итого HTTPS: TCP handshake (1 RTT) + TLS handshake (1–2 RTT) + HTTP запрос.
+  - **QUIC** — совмещает транспорт и TLS в одном handshake (1 RTT, 0-RTT при resumption), работает поверх UDP.
+
+- Частые вопросы на собеседовании
+  - **«Что такое 3-way handshake?»** — Установка TCP-соединения за три шага: SYN → SYN-ACK → ACK. Синхронизирует ISN, согласует параметры, подтверждает, что обе стороны живы.
+  - **«Почему три шага, а не два?»** — Два шага не позволяют обеим сторонам **одновременно** синхронизировать ISN и подтвердить получение. Третий ACK подтверждает, что клиент получил SYN-ACK, и сервер уверен, что клиент жив. Также защищает от старых дубликатов SYN.
+  - **«Почему ISN случайный?»** — Защита от spoofing и sequence prediction. Предсказуемый ISN позволяет атакующему подделать пакеты.
+  - **«Что такое SYN flood и как защищаться?»** — Много SYN с поддельных IP → переполнение half-open очереди. Защита: SYN cookies, `tcp_max_syn_backlog`, rate limiting, firewall.
+  - **«Почему закрытие — 4 шага, а открытие — 3?»** — TCP полудуплексный: каждая сторона закрывает своё направление отдельно (FIN + ACK), поэтому 4 шага. Открытие симметрично — третий ACK совмещает подтверждение и открытие.
+  - **«Что такое half-open connection?»** — Состояние `SYN_RECV` на сервере: SYN получен, SYN-ACK отправлен, ACK не пришёл. Может быть нормой (медленный клиент) или признаком SYN flood.
+  - **«Что такое TIME_WAIT и зачем?»** — Состояние после закрытия, 2×MSL (обычно 60 с). Защита от запоздавших пакетов старого соединения и гарантия, что последний ACK дошёл. Много TIME_WAIT → исчерпание портов, `SO_REUSEADDR`, тюнинг.
+  - **«Сколько RTT занимает handshake?»** — 1 RTT (SYN → SYN-ACK → ACK). Плюс TLS: TLS 1.2 — 2 RTT, TLS 1.3 — 1 RTT (0-RTT при resumption).
+  - **«Что такое SYN cookies?»** — Защита от SYN flood: сервер не хранит состояние для SYN, кодирует его в ISN (hash). При ACK восстанавливает. `net.ipv4.tcp_syncookies`.
+  - **«Какие опции согласуются в handshake?»** — MSS, window scaling, SACK permitted, timestamps, TFO.
+
+- Короткий ответ на собеседовании
+  - 3-way handshake — это процесс установки TCP-соединения за три шага: клиент шлёт **SYN** со своим ISN, сервер отвечает **SYN-ACK** со своим ISN и подтверждением клиентского, клиент шлёт **ACK**. Цель — синхронизировать начальные sequence numbers обеих сторон, согласовать опции (MSS, window scaling, SACK, timestamps) и убедиться, что обе стороны живы и могут отправлять/принимать. ISN случайный для защиты от spoofing. Состояния: клиент `SYN_SENT` → `ESTABLISHED`, сервер `LISTEN` → `SYN_RECV` → `ESTABLISHED`. Handshake занимает 1 RTT; для HTTPS добавляется TLS handshake (TLS 1.2 — 2 RTT, TLS 1.3 — 1 RTT). Закрытие — **4-way** (FIN/ACK → ACK → FIN/ACK → ACK), потому что TCP полудуплексный. Главная атака — **SYN flood**: много SYN с поддельных IP, переполнение half-open очереди; защита — **SYN cookies** (`tcp_syncookies`), `tcp_max_syn_backlog`, rate limiting. Смотреть — `tcpdump` с фильтром по SYN, `ss -tan state syn-recv/syn-sent/established`.
+
+- Что запомнить железно
+  - **3-way: SYN → SYN-ACK → ACK**, 1 RTT.
+  - **Цель** — синхронизировать ISN, согласовать опции, подтвердить, что обе стороны живы.
+  - **ISN случайный** — защита от spoofing/sequence prediction.
+  - **Состояния**: `SYN_SENT`, `SYN_RECV`, `ESTABLISHED`.
+  - **Закрытие — 4-way** (FIN/ACK → ACK → FIN/ACK → ACK), TCP полудуплексный.
+  - **TIME_WAIT** — 2×MSL после закрытия, защита от старых пакетов.
+  - **SYN flood** — атака на half-open очередь, защита — **SYN cookies**, `tcp_max_syn_backlog`.
+  - **`somaxconn`** — очередь accept, **`tcp_max_syn_backlog`** — очередь SYN.
+  - **Опции**: MSS, window scaling, SACK, timestamps.
+  - **HTTPS** = TCP handshake (1 RTT) + TLS handshake (TLS 1.2 — 2 RTT, TLS 1.3 — 1 RTT).
+  - **QUIC** — handshake совмещён (1 RTT, 0-RTT), поверх UDP.
+  - **`ss -tan state syn-recv`** — посмотреть half-open.
