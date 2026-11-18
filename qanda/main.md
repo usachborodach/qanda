@@ -947,7 +947,7 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - **Важно:** это модель, а не «магия». Реализуется CNI-плагином (overlay, routing, eBPF).
 
 - Уровень 2: как это реализовано в Linux
-  - **Каждый под работает в своём network namespace** — не каждый процесс, как в заметке, а именно **под** (точнее, sandbox-контейнер пода). Процессы внутри одного контейнера делят netns, контейнеры внутри пода тоже делят один netns.
+  - **Каждый под работает в своём network namespace** (точнее, sandbox-контейнер пода). Процессы внутри одного контейнера делят netns, контейнеры внутри пода тоже делят один netns.
   - **pause-контейнер (sandbox)** — служебный контейнер в каждом поде, который **держит network namespace открытым**. Если контейнер приложения упадёт и перезапустится, netns останется, IP не поменяется. Pause создаётся kubelet'ом через CRI (containerd/CRI-O).
   - **veth-пара** — виртуальный Ethernet-кабель: один конец в netns пода, другой — в netns хоста (или в bridge/overlay). Так под «подключается» к сети ноды.
   - **Каждая нода получает свой CIDR** для подов (например, `10.244.1.0/24` на node-1, `10.244.2.0/24` на node-2). Под получает IP из диапазона своей ноды.
@@ -990,7 +990,7 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - **Cilium может заменить kube-proxy** полностью (eBPF), без iptables/IPVS.
 
 - Уровень 6: типы Service
-  - **ClusterIP** (default) — виртуальный IP, доступен **только внутри кластера**. Не «ClusterApi», как в заметке — **ClusterIP**.
+  - **ClusterIP** (default) — виртуальный IP, доступен **только внутри кластера**.
   - **NodePort** — открывает порт (30000–32767) на **каждой ноде**, трафик `NodeIP:NodePort` → Service → поды. Обращаться по адресам нод. Обычно используется как база для LoadBalancer или для dev.
   - **LoadBalancer** — облачный LB (AWS NLB/ALB, GCP LB, Azure LB), один внешний IP, трафик идёт на ноды → Service → поды. **Дороже** (каждый LB = деньги), cloud-controller-manager следит за нодами.
   - **ExternalName** — DNS CNAME на внешний сервис, без проксирования.
@@ -1810,3 +1810,11 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - **«Что такое BGP hijacking?»** — Злонамеренный (или ошибочный) анонс чужого префикса → трафик уводится. Защита — RPKI/ROV, но принята не полностью.
   - **«Зачем BGP в Kubernetes?»** — Calico/Cilium анонсируют pod CIDR и Service IP в физическую сеть; MetalLB анонсирует внешние IP сервисов. Позволяет on-prem LB и нативную маршрутизацию без overlay.
   - **«Почему BGP медленно сходится?»** — Path-vector, политики, TCP-сессии; нужны BFD, graceful restart, tuning timers.
+
+---
+
+# Kubernetes. Recources
+- Limits (верхняя граница для oom киллера)
+- Requests (минимальные требования)
+- CPU, Memory, HugePages
+- Обязательно задавать окорректны значения. В противном случае поды начнут постоянно рестартовать
