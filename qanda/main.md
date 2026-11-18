@@ -1837,3 +1837,486 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - `kubectl port-forward service/myservice 10000:80` — локальный порт 10000 → Service → под.
   - `kubectl port-forward pod/mypod 8080:80` — напрямую на под.
   - Только для отладки, **не для прода** (нет HA, нет балансировки, туннель через apiserver).
+
+---
+
+# Как развернуть высоконагруженную СУБД в Kubernetes
+
+- Почему «просто контейнер» — плохая идея
+  - **Фундаментальный конфликт**: контейнеры и оркестраторы спроектированы для **эфемерных, stateless-процессов**, которые можно убить и пересоздать в любой момент. База данных — **stateful-сервис**, где данные и их целостность — главное.
+  - **Риск потери данных**: динамическое планирование может переместить под с БД на другой узел, а его диски — нет.
+  - **Сложность эксплуатации**: администрирование и отладка БД в K8s сложнее, требуют специальных контейнеров для обновлений.
+  - **Недостаток контроля над ресурсами**: K8s не гарантирует эксклюзивного доступа к CPU и диску, что для БД критично — база может попасть на перегруженный узел, вызвав скачки latency.
+
+- Шаг 1: StatefulSet — обязательная база, но не решение
+  - **Что даёт**: стабильную сетевую идентичность (`pg-0`, `pg-1`, `pg-2`), стабильное хранилище (свой PVC на каждый под, переживает пересоздание пода), упорядоченный запуск/остановку.
+  - **Чего не даёт**: автоматического failover, репликации, бэкапов, PITR, обновлений версий. Решает только «где и как запустить экземпляр».
+
+- Шаг 2: Оператор — «мозг» для управления БД
+  - **Что это**: приложение, расширяющее API Kubernetes и инкапсулирующее знания эксперта по эксплуатации конкретной СУБД. Вы описываете желаемое состояние кластера БД в YAML, оператор приводит инфраструктуру к нему.
+  - **Ключевые возможности**: развёртывание кластера, настройка репликации, **автоматический failover** (выбор нового мастера), бэкапы и восстановление, обновления версий, масштабирование.
+  - **Примеры операторов**:
+    - **CloudNativePG (CNPG)** — PostgreSQL, community-driven, CNCF Incubating. Управляет подами напрямую, без StatefulSet. Использует **primary/standby** с нативной потоковой репликацией и **кворумной синхронной репликацией** — транзакция подтверждается только после записи на кворум реплик, что исключает потерю данных при failover.
+    - **Zalando Postgres Operator** — PostgreSQL, на Patroni, используется в масштабе Zalando.
+    - **Crunchy PGO** — PostgreSQL, интегрирован с pgBackRest.
+    - **Percona XtraDB Cluster (PXC) Operator** — MySQL, автоматически создаёт StatefulSet, настраивает master-slave и прокси.
+
+- Шаг 3: Хранилище — фундамент производительности
+  - **Local NVMe (рекомендуемый выбор для production)**:
+    - Микросекундная задержка, полная пропускная способность диска.
+    - **Минус**: данные привязаны к узлу, при отказе узла теряются.
+    - **Durability** обеспечивается **репликацией на уровне СУБД** (несколько реплик на разных узлах, синхронная репликация).
+    - Для автоматизации подготовки локальных дисков (RAID0, XFS) — `NodeConfig` CR (ScyllaDB Operator) или аналогичные механизмы оператора.
+  - **Network-attached storage (EBS, Persistent Disk, Ceph RBD)**:
+    - PV можно перемонтировать на другой узел — данные переживают потерю ноды.
+    - **Минус**: latency на миллисекунды, ограниченная пропускная способность. **Не подходит для high-IOPS нагрузки.**
+  - **`reclaimPolicy: Retain`** — обязательно для PVC с данными, чтобы случайное удаление PVC не привело к потере данных.
+  - **`volumeBindingMode: WaitForFirstConsumer`** — обязательно для multi-AZ (EBS, GCE PD, local PV), иначе PV создастся в одной AZ, а под запланируется в другой.
+  - **NFS для `$PGDATA` — нельзя**: риск потери данных из-за некорректной работы `fsync` на NFS.
+
+- Шаг 4: Отказоустойчивость и планирование (Scheduling)
+  - **Pods на отдельных узлах**: `podAntiAffinity` с `topologyKey: kubernetes.io/hostname` — каждая реплика на своём узле.
+  - **Балансировка по зонам**: `topologySpreadConstraints` с `topologyKey: topology.kubernetes.io/zone` — равномерное распределение по AZ, чтобы потеря зоны не привела к потере кворума.
+
+- Шаг 5: Ресурсы и производительность
+  - **Guaranteed QoS**: `requests` = `limits` для CPU и памяти — поды в классе Guaranteed, защищены от eviction при нехватке ресурсов.
+  - **Тюнинг под лимиты**: параметры СУБД (`shared_buffers` в PostgreSQL) настраиваются с учётом лимитов памяти контейнера, чтобы избежать OOM-kill.
+
+- Шаг 6: Защита данных — бэкапы и PITR
+  - **Непрерывное архивирование WAL**: все современные операторы (CNPG, Zalando, Crunchy) поддерживают архивацию WAL в объектное хранилище (S3, GCS, Azure Blob).
+  - **Point-in-Time Recovery (PITR)**: восстановление на любой момент времени — критично для отката после ошибочных миграций.
+  - **Полные бэкапы**: регулярные (pgBackRest, Barman Cloud) для быстрого восстановления.
+  - **Velero** — бэкап всего состояния кластера (манифесты + PV snapshots или file-system backup) для защиты от ошибок оператора или катастрофических сбоев. Запускается по расписанию, управляется через GitOps.
+  - **Репликация не заменяет бэкапы**: защищает от отказа узла, но не от логических ошибок (`DROP TABLE`, ошибочная миграция).
+
+- Когда можно (и нужно) запускать БД в Kubernetes
+  - **Подходит**: read-реплики, dev/test, временные сервисы, новые cloud-native приложения, где скорость развёртывания и автоматизация важнее абсолютной производительности на единицу ресурсов.
+  - **Не подходит (пока)**: высоконагруженные **core** транзакционные системы с экстремальными требованиями к latency и ценой простоя — для них всё ещё предпочитают VM или выделенные серверы.
+
+- Итоговый чек-лист для production
+  | Компонент | Рекомендация |
+  |---|---|
+  | **Управление** | Оператор (CloudNativePG, Zalando, Crunchy, Percona) |
+  | **Хранилище** | Local NVMe (скорость) + durability через репликацию СУБД |
+  | **reclaimPolicy** | Retain |
+  | **volumeBindingMode** | WaitForFirstConsumer |
+  | **Планирование** | podAntiAffinity по hostname + topologySpreadConstraints по zone |
+  | **Ресурсы** | Guaranteed QoS (requests = limits) |
+  | **Репликация** | Синхронная кворумная, минимум 3 инстанса |
+  | **Бэкапы** | WAL-архивация + полные бэкапы + PITR + Velero |
+  | **NFS для `$PGDATA`** | Не использовать |
+
+- Короткий ответ на собеседовании
+  - Запускать БД в Kubernetes можно, но только по правильному паттерну. «Голый» контейнер или даже StatefulSet недостаточно — они не решают failover, репликацию и бэкапы. Правильный подход: **Оператор** (CloudNativePG для PostgreSQL, Percona для MySQL) — он управляет жизненным циклом кластера БД как единым объектом, включая автоматический failover и кворумную синхронную репликацию. Для производительности выбирают **Local NVMe** (микросекундная latency), а durability обеспечивают **репликацией на уровне СУБД**. Поды разносим по узлам (`podAntiAffinity`) и зонам (`topologySpreadConstraints`), ставим **Guaranteed QoS** (`requests=limits`), тюним `shared_buffers` под лимиты. Бэкапы — двух уровней: встроенные средства оператора (WAL-архивация + PITR) и Velero для всего состояния кластера. `reclaimPolicy: Retain` и `WaitForFirstConsumer` — обязательны, NFS для `$PGDATA` — нельзя. Для core-транзакционных систем с экстремальными требованиями к latency всё ещё часто предпочитают VM, но тренд к K8s растёт (CNPG, Vitess, CockroachDB, TiDB в проде у крупных компаний).
+
+- Что запомнить железно
+  - **StatefulSet ≠ решение для БД** — только стабильные имена и диски.
+  - **Оператор — единственный production-grade паттерн** для БД в K8s.
+  - **Local NVMe** — для скорости, **durability через репликацию СУБД**.
+  - **Network storage** — для мобильности PV, но выше latency.
+  - **`podAntiAffinity` по hostname** + **`topologySpreadConstraints` по zone**.
+  - **Guaranteed QoS** (`requests = limits`) — обязательно.
+  - **Кворумная синхронная репликация**, минимум 3 инстанса.
+  - **`reclaimPolicy: Retain`** и **`volumeBindingMode: WaitForFirstConsumer`** — обязательны.
+  - **WAL-архивация + PITR + Velero** — два уровня защиты.
+  - **NFS для `$PGDATA` — нельзя** (fsync).
+  - **Репликация ≠ бэкап**: не защищает от `DROP TABLE` и ошибочных миграций.
+  - **Core-транзакционные системы** — часто всё ещё VM, но тренд к K8s растёт.
+
+---
+
+# Kubernetes. Что такое QoS?
+
+- Что это
+  - Классификация подов по **приоритету выживания** при нехватке ресурсов на ноде.
+  - Определяется **автоматически** kubelet'ом на основе `requests`/`limits` контейнеров — нельзя задать в YAML вручную.
+  - Три класса: **Guaranteed**, **Burstable**, **BestEffort**.
+  - Влияет на **eviction** при `MemoryPressure`, `DiskPressure`, `PIDPressure`, `NodePressure`.
+  - Влияет на **OOM score** — при OOM killer ядра первыми умирают поды с высоким OOM score (BestEffort).
+  - **Не путать с PriorityClass**: PriorityClass — это **вручную задаваемый** приоритет для **scheduler'а** (кого планировать первым и кого preempt'ить). QoS — автоматическая классификация для **kubelet eviction** и **OOM killer**. Они работают вместе, но это разные механизмы.
+
+- Три класса QoS
+
+  - **Guaranteed** (самый высокий)
+    - Условие: **у каждого** контейнера в поде заданы **и `requests`, и `limits`**, и для **каждого ресурса** (CPU, memory) они **равны** (`requests == limits`).
+    - Все контейнеры в поде должны соответствовать — один «неправильный» контейнер понижает весь под.
+    - Поды **выселяются последними** при нехватке ресурсов.
+    - Самый низкий OOM score — OOM killer убивает их последними.
+    - Для чего: **БД, критичные сервисы, stateful-нагрузки** — то, что не должно умирать.
+
+  - **Burstable** (средний)
+    - Условие: **хотя бы один** контейнер имеет `requests` или `limits`, но **не выполняется условие Guaranteed** (не все ресурсы заданы, или `requests != limits`).
+    - Самый частый класс на практике — так работает большинство приложений.
+    - Поды выселяются **после** BestEffort, но **до** Guaranteed.
+    - Может использовать больше ресурсов, чем `requests`, если на ноде есть свободное место (до `limits`).
+    - OOM score зависит от того, насколько фактическое использование превышает `requests`.
+
+  - **BestEffort** (самый низкий)
+    - Условие: **ни один** контейнер не имеет `requests` и `limits` (вообще ничего не задано).
+    - Поды выселяются **первыми** при любом давлении на ноду.
+    - Самый высокий OOM score — OOM killer убивает их первыми.
+    - Может использовать сколько угодно ресурсов, если они свободны, но при конкуренции — страдает первым.
+    - Для чего: dev, тесты, неважные batch-задачи.
+
+- Как проверить класс
+  ```bash
+  kubectl get pod <pod> -o jsonpath='{.status.qosClass}'
+  kubectl describe pod <pod> | grep -i qos
+  ```
+
+- Eviction — что происходит при нехватке ресурсов
+  - Kubelet мониторит ноду: `MemoryPressure`, `DiskPressure`, `PIDPressure`.
+  - При давлении начинает **eviction** подов, начиная с **BestEffort**, потом **Burstable**, **Guaranteed** — последними.
+  - Внутри одного класса — сортировка по **потреблению относительно `requests`**: кто больше превышает — тот уходит первым.
+  - **`ephemeral-storage`** (локальный диск) тоже участвует: если под забивает диск, он может быть выселен независимо от QoS.
+  - **`evictionHard`** и **`evictionSoft`** в kubelet-конфиге задают пороги (например, `memory.available<100Mi`).
+  - **`pod.terminationGracePeriodSeconds`** — сколько ждать graceful shutdown при eviction.
+  - **`PodDisruptionBudget`** — ограничивает, сколько подов можно вывести **добровольно** (drain, eviction API), но **не** защищает от **вынужденного** eviction при давлении на ноду.
+
+- QoS vs PriorityClass — не путать
+  | | QoS | PriorityClass |
+  |---|---|---|
+  | Как задаётся | автоматически по `requests`/`limits` | вручную в `spec.priorityClassName` |
+  | Кто использует | kubelet (eviction, OOM score) | scheduler (порядок планирования, preemption) |
+  | Классы | Guaranteed, Burstable, BestEffort | произвольные (например, `high-priority`, `low-priority`) |
+  | Влияет на | eviction при давлении на ноду | кого планировать первым, кого вытеснять при нехватке места на ноде |
+  | Когда срабатывает | когда нода уже под давлением | когда scheduler не может найти место для пода |
+  - **PriorityClass** нужен, чтобы критичный под запланировался **первым** и вытеснил менее важные поды (preemption), если места нет.
+  - **QoS** нужен, чтобы критичный под **выжил** при eviction на уже работающей ноде.
+  - **Обычно используют вместе**: БД → `Guaranteed` + `PriorityClass: high`.
+  - **Системные поды** (`kube-system`) имеют высокий PriorityClass (`system-cluster-critical`, `system-node-critical`), чтобы не быть вытесненными.
+
+- Практические рекомендации
+  - **БД, stateful, критичное**: `Guaranteed` — `requests == limits` для CPU и memory. Плюс `PriorityClass: high` для планирования.
+  - **Обычные stateless-приложения**: `Burstable` — `requests` для планирования, `limits` для защиты от runaway.
+  - **Dev, тесты, batch**: `BestEffort` — без ресурсов, чтобы не занимать место, но готовы к eviction.
+  - **Не задавать `limits` для CPU** — CPU throttling может сильно замедлить приложение (особенно latency-sensitive). Для CPU лучше `requests` = гарантия, `limits` = потолок, но иногда без `limits` лучше (Burstable с высоким `requests`).
+  - **Всегда задавать `requests`** — иначе scheduler не знает, сколько нужно, и под может попасть на перегруженную ноду.
+  - **`limits` для memory обязательны** — иначе под может съесть всю память ноды и вызвать OOM killer для других.
+  - **Guaranteed для БД** — обязательно, иначе при `MemoryPressure` под выселится и БД упадёт.
+  - **Помнить про `ephemeral-storage`** — `requests.ephemeral-storage` и `limits.ephemeral-storage` тоже влияют на eviction по `DiskPressure`.
+
+- Типичные ошибки
+  - **Задать `requests` без `limits`** → Burstable, но не Guaranteed, при eviction уйдёт раньше критичных.
+  - **Задать `limits` без `requests`** → Burstable, `requests` = `limits` по факту, но лучше задать явно.
+  - **`requests != limits` для Guaranteed** → на самом деле Burstable, класс не тот.
+  - **Один контейнер в поде без ресурсов** → весь под BestEffort, даже если остальные Guaranteed.
+  - **Думать, что QoS защищает от OOM killer** → нет, OOM killer ядра использует OOM score, который зависит от QoS, но `limits` — главная защита.
+  - **Думать, что PodDisruptionBudget защищает от eviction** → нет, только от **добровольного** disruption (drain, eviction API), не от вынужденного при давлении на ноду.
+  - **Путать QoS с PriorityClass** → разные механизмы для разных фаз.
+
+- Частые вопросы на собеседовании
+  - **«Что такое QoS в Kubernetes?»** — Автоматическая классификация подов (Guaranteed, Burstable, BestEffort) на основе `requests`/`limits`. Определяет порядок eviction при нехватке ресурсов и OOM score.
+  - **«Как получить Guaranteed?»** — `requests == limits` для **всех** ресурсов **всех** контейнеров в поде. Один контейнер без ресурсов → весь под не Guaranteed.
+  - **«Чем QoS отличается от PriorityClass?»** — QoS — автоматическая классификация для kubelet (eviction, OOM). PriorityClass — вручную задаваемый приоритет для scheduler (порядок планирования, preemption).
+  - **«Какой класс для БД?»** — Guaranteed (`requests == limits`) + `PriorityClass: high` для планирования. Иначе при `MemoryPressure` БД выселится.
+  - **«Что происходит при eviction?»** — Kubelet выселяет поды, начиная с BestEffort, потом Burstable, Guaranteed — последними. Внутри класса — кто больше превышает `requests`.
+  - **«Может ли QoS защитить от OOM killer?»** — Косвенно: Guaranteed имеет низкий OOM score, убивается последним. Но главная защита — `limits` на память.
+  - **«Защищает ли PDB от eviction?»** — Нет, только от **добровольного** disruption (drain, eviction API). От вынужденного eviction при давлении на ноду — нет.
+  - **«Почему `limits` для CPU опасны?»** — CPU throttling может сильно замедлить latency-sensitive приложения. Для CPU часто лучше `requests` без `limits` (Burstable), чтобы использовать свободные CPU.
+  - **«QoS и ephemeral-storage?»** — `requests.ephemeral-storage`/`limits.ephemeral-storage` тоже влияют на eviction по `DiskPressure`.
+
+- Короткий ответ на собеседовании
+  - QoS в Kubernetes — это автоматическая классификация подов по приоритету выживания при нехватке ресурсов. Три класса: **Guaranteed** (`requests == limits` для всех ресурсов всех контейнеров), **Burstable** (хотя бы один `requests`/`limits`, но не Guaranteed), **BestEffort** (ничего не задано). Класс определяется kubelet'ом автоматически, вручную задать нельзя. При `MemoryPressure`/`DiskPressure` kubelet выселяет поды: BestEffort первыми, Burstable средними, Guaranteed последними. OOM score также зависит от QoS — BestEffort умирает первым. QoS не путать с PriorityClass: QoS — для kubelet eviction и OOM, PriorityClass — для scheduler (порядок планирования, preemption). Для БД и критичных сервисов — Guaranteed + PriorityClass high. Для обычных приложений — Burstable. Для dev — BestEffort. PodDisruptionBudget защищает только от добровольного disruption (drain), не от вынужденного eviction. `limits` на память обязательны, на CPU — осторожно (throttling).
+
+- Что запомнить железно
+  - **QoS — автоматическая классификация**, не задаётся вручную.
+  - **Три класса**: Guaranteed, Burstable, BestEffort.
+  - **Guaranteed** = `requests == limits` для **всех** ресурсов **всех** контейнеров.
+  - **Eviction**: BestEffort → Burstable → Guaranteed (последними).
+  - **OOM score**: BestEffort убивается первым, Guaranteed — последним.
+  - **QoS ≠ PriorityClass**: QoS — kubelet (eviction/OOM), PriorityClass — scheduler (планирование/preemption).
+  - **БД → Guaranteed + PriorityClass high.**
+  - **Обычные приложения → Burstable.**
+  - **Dev/тесты → BestEffort.**
+  - **PDB не защищает от вынужденного eviction** — только от добровольного.
+  - **`limits` на память обязательны**, на CPU — осторожно (throttling).
+  - **Один контейнер без ресурсов → весь под BestEffort.**
+  - **`ephemeral-storage`** тоже участвует в eviction по `DiskPressure`.
+  - **Проверить**: `kubectl get pod <pod> -o jsonpath='{.status.qosClass}'`.
+
+---
+
+# Kubernetes. Что такое PriorityClass?
+
+- Что это
+  - **Cluster-scoped** (не namespaced) объект API `scheduling.k8s.io/v1`.
+  - Сопоставляет **имя класса** (например, `high-priority`) с **целым числом** — приоритетом.
+  - **Чем выше число — тем выше приоритет.**
+  - Под получает приоритет, если в его `spec.priorityClassName` указано имя PriorityClass.
+  - **Напрямую `spec.priority` задавать нельзя** — он вычисляется из PriorityClass.
+  - Feature state: **Stable** с Kubernetes v1.14.
+
+- Зачем нужен
+  - **Порядок планирования**: scheduler ставит поды с более высоким приоритетом **впереди** в очереди ожидания.
+  - **Preemption (вытеснение)**: если под не может быть запланирован, scheduler **вытесняет** поды с более низким приоритетом, чтобы освободить место.
+  - **Защита критичных нагрузок**: БД, ingress, мониторинг, DNS — должны планироваться первыми и не страдать от «голодных» batch-задач.
+  - **Отличие от QoS**: QoS работает **после** планирования (eviction на ноде при давлении). PriorityClass работает **до** планирования (preemption для освобождения места).
+
+- Как работает preemption (пошагово)
+  1. Под с высоким приоритетом не может быть запланирован — на всех нодах недостаточно ресурсов.
+  2. Scheduler ищет ноду, с которой можно **вытеснить** поды с **более низким приоритетом**, чтобы освободить достаточно места.
+  3. Выбирает **набор жертв** с **наименьшим приоритетом** (QoS при этом **не учитывается** в выборе жертв — только PriorityClass).
+  4. Вытесняемым подам отправляется **graceful termination** (SIGTERM, ожидание `terminationGracePeriodSeconds`).
+  5. После освобождения места высокоприоритетный под планируется.
+  5. **Preemption respects graceful termination, но не гарантирует соблюдение PodDisruptionBudget**.
+
+- Ключевые поля PriorityClass
+  - **`value`** (обязательное) — целое число, **чем больше, тем выше**. Диапазон: **-2,147,483,648 … 1,000,000,000** (32-bit signed, но значения >1 млрд зарезервированы за встроенными системными классами).
+  - **`globalDefault`** (опционально) — если `true`, этот класс применяется к подам **без `priorityClassName`**. В кластере может быть **только один** такой класс.
+  - **`description`** (опционально) — произвольная строка для документации: когда использовать класс.
+  - **`preemptionPolicy`** (опционально) — `PreemptLowerPriority` (по умолчанию) или `Never` (не вытеснять других).
+
+- Встроенные PriorityClass
+  - Kubernetes уже содержит два класса для **критичных системных компонентов**:
+    - **`system-cluster-critical`** — критичные для кластера add-on'ы (DNS, metrics-server, ingress и т.д.). Значение: **2,000,000,000**.
+    - **`system-node-critical`** — **самый высокий** доступный приоритет, даже выше cluster-critical. Значение: **2,000,001,000**.
+  - Поды с этими классами **гарантированно планируются первыми** и не должны вытесняться.
+  - **Важно**: приоритет не предотвращает eviction полностью — он гарантирует, что под **будет пересоздан** и не останется навсегда недоступным.
+
+- Пример PriorityClass
+  ```yaml
+  apiVersion: scheduling.k8s.io/v1
+  kind: PriorityClass
+  metadata:
+    name: high-priority
+  value: 1000000
+  globalDefault: false
+  description: "Для критичных сервисов (БД, ingress)"
+  ```
+  Применение к поду:
+  ```yaml
+  spec:
+    priorityClassName: high-priority
+    containers: ...
+  ```
+
+- PriorityClass vs QoS — не путать
+  | | PriorityClass | QoS |
+  |---|---|---|
+  | Как задаётся | **вручную** в `spec.priorityClassName` | **автоматически** по `requests`/`limits` |
+  | Кто использует | **scheduler** (порядок планирования, preemption) | **kubelet** (eviction при давлении, OOM score) |
+  | Когда срабатывает | когда под **не может быть запланирован** | когда нода **уже под давлением** ресурсов |
+  | Что делает | вытесняет низкоприоритетные поды, чтобы освободить место | выселяет поды с низким QoS при нехватке ресурсов на ноде |
+  | Учитывается ли при выборе жертв preemption | **Да** (только он) | **Нет** (QoS не учитывается в preemption) |
+  | Для БД | `high` + `Guaranteed` | `Guaranteed` (requests==limits) |
+  - **Scheduler учитывает PriorityClass раньше, чем QoS**.
+  - Обычно **используют вместе**: БД → PriorityClass `high` + QoS `Guaranteed`.
+
+- Практические рекомендации
+  - **Не создавать слишком много классов** — 3–5 достаточно (critical, high, normal, low, batch).
+  - **Не давать `system-*` классы пользовательским подам** — только для системных add-on'ов.
+  - **`globalDefault: true`** — удобно для дефолтного приоритета, но помнить: в кластере может быть **только один** такой класс.
+  - **Preemption может «шуметь»**: вытесняемые поды перезапускаются, это может вызывать каскадные эффекты. Для batch-задач — рассмотреть `preemptionPolicy: Never` или низкий приоритет.
+  - **Защита от злоупотреблений**: в недоверенном кластере пользователь может создать под с максимальным приоритетом и вытеснить всё. Использовать **ResourceQuota** и **RBAC**, чтобы ограничить, кто может создавать поды с высокими PriorityClass.
+  - **Preemption не гарантирует PDB** — если критично, использовать `PodDisruptionBudget` для **добровольных** disruption'ов (drain), но preemption его **не соблюдает**.
+  - **Мониторинг**: отслеживать события `Preempted`, `FailedScheduling` с указанием приоритета.
+
+- Типичные ошибки
+  - **Путать PriorityClass и QoS** — разные механизмы, работают на разных фазах.
+  - **Задать `spec.priority` напрямую** — нельзя, только через `priorityClassName`.
+  - **Дать всем подам `system-node-critical`** — тогда preemption не работает (все равны), и системные компоненты могут пострадать.
+  - **Ожидать, что PriorityClass защитит от OOM killer** — нет, для этого нужен QoS `Guaranteed` и `limits` на память.
+  - **`globalDefault: true` на нескольких классах** — ошибка валидации, только один.
+  - **Preemption «убивает» stateful-поды** — если вытеснят БД с низким PriorityClass, она перезапустится. Для БД — высокий PriorityClass + Guaranteed QoS.
+  - **Удаление PriorityClass** — существующие поды сохраняют приоритет, но новые с этим именем создать нельзя.
+
+- Частые вопросы на собеседовании
+  - **«Что такое PriorityClass?»** — Cluster-scoped объект, задающий целочисленный приоритет подам. Scheduler использует его для порядка планирования и preemption (вытеснения низкоприоритетных подов при нехватке места).
+  - **«Как работает preemption?»** — Если под не может быть запланирован, scheduler ищет ноду, с которой можно вытеснить поды с более низким приоритетом (QoS не учитывается при выборе жертв), ждёт graceful termination, затем планирует под.
+  - **«PriorityClass vs QoS?»** — PriorityClass — ручной приоритет для scheduler (preemption). QoS — автоматическая классификация для kubelet (eviction при давлении, OOM score). Работают на разных фазах, обычно вместе.
+  - **«Какие встроенные PriorityClass?»** — `system-cluster-critical` (2 млрд) и `system-node-critical` (2,000,001,000 — самый высокий). Для системных add-on'ов.
+  - **«Что такое `globalDefault`?»** — Класс по умолчанию для подов без `priorityClassName`. Только один такой класс в кластере.
+  - **«Можно ли задать приоритет напрямую?»** — Нет, только через `spec.priorityClassName`, ссылающийся на PriorityClass.
+  - **«Preemption и PodDisruptionBudget?»** — Preemption **не соблюдает** PDB, только graceful termination.
+  - **«Как защититься от злоупотребления высокими приоритетами?»** — RBAC + ResourceQuota, ограничить, кто может создавать поды с высокими PriorityClass.
+  - **«Что такое `preemptionPolicy: Never`?»** — Под с этим классом **не вытесняет** другие поды, даже если у него высокий приоритет (non-preempting).
+
+- Короткий ответ на собеседовании
+  - PriorityClass — это cluster-scoped объект, который задаёт целочисленный приоритет подам. Scheduler использует его для **порядка планирования** (высокоприоритетные поды впереди очереди) и **preemption**: если под не может быть запланирован, scheduler вытесняет поды с более низким приоритетом, чтобы освободить место. Preemption **не учитывает QoS** при выборе жертв — только PriorityClass. Два встроенных класса: `system-cluster-critical` и `system-node-critical` (самый высокий) — для системных компонентов. Поля: `value` (−2^31 … 1 млрд), `globalDefault` (только один в кластере), `description`, `preemptionPolicy` (`PreemptLowerPriority` или `Never`). **Не путать с QoS**: PriorityClass — ручной приоритет для scheduler (preemption), QoS — автоматическая классификация для kubelet (eviction при давлении на ноду, OOM score). Обычно используют вместе: БД → PriorityClass `high` + QoS `Guaranteed`. Preemption не гарантирует PDB, а злоупотребление высокими приоритетами ограничивается RBAC и ResourceQuota.
+
+- Что запомнить железно
+  - **PriorityClass — cluster-scoped**, задаёт **целое число** (выше = важнее).
+  - **Scheduler использует для preemption**, QoS — **не учитывается** при выборе жертв.
+  - **Preemption** = вытеснение низкоприоритетных подов, когда место не хватает.
+  - **Два встроенных**: `system-cluster-critical`, `system-node-critical` (высший).
+  - **`globalDefault`** — только один класс в кластере.
+  - **`preemptionPolicy: Never`** — под не вытесняет других.
+  - **PriorityClass ≠ QoS**: PriorityClass — scheduler/preemption, QoS — kubelet/eviction.
+  - **Не задавать `spec.priority` напрямую** — только через `priorityClassName`.
+  - **Preemption не соблюдает PDB**, только graceful termination.
+  - **RBAC + ResourceQuota** — защита от злоупотребления приоритетами.
+  - **Для БД**: `PriorityClass: high` + `QoS: Guaranteed`.
+
+---
+
+# 12-factor app
+
+- Что это
+  - Методология из **12 принципов** для cloud-native приложений.
+  - Сформулирована в 2011 году инженерами **Heroku** (Adam Wiggins).
+  - Не фреймворк, не библиотека — набор **практик и соглашений**.
+  - Цель: приложение, которое легко **деплоить, масштабировать, переносить** между средами.
+  - Хорошо ложится на **Docker, Kubernetes, CI/CD, GitOps**.
+  - Официальный сайт: `12factor.net`.
+  - Расширения: **Beyond 12-factor** (observability, security, API-first), **15-factor** (добавляет API-first, telemetry, auth), **12-factor для data** (dataops).
+
+- 12 факторов
+
+  - **1. Codebase (кодовая база)**
+    - Одна кодовая база в системе контроля версий (Git), **много деплоев** (dev/stage/prod).
+    - Не «одна база — один деплой», а «одна база — много окружений».
+    - Несколько кодовых баз → это **распределённая система** (микросервисы), а не одно приложение.
+    - Антипаттерн: копирование кода для разных окружений, «ветка prod».
+
+  - **2. Dependencies (зависимости)**
+    - Явно объявлять и **изолировать** зависимости (`package.json`, `go.mod`, `requirements.txt`, `pom.xml`).
+    - Не полагаться на «глобально установленное» в системе.
+    - **Vendoring** — фиксировать версии, lock-файлы.
+    - Контейнеры решают это «из коробки»: всё внутри образа.
+    - Антипаттерн: `pip install` без `requirements.txt`, зависимость от системных библиотек.
+
+  - **3. Config (конфигурация)**
+    - Конфигурация — **в переменных окружения**, не в коде.
+    - Разные окружения — разные env, **один и тот же образ**.
+    - Не хранить креды, URL, флаги в коде или в файлах в репозитории.
+    - В K8s: `ConfigMap` (неконфиденциальное) + `Secret` (конфиденциальное).
+    - Антипаттерн: `config.prod.yaml` в Git, захардкоженные пароли, `if (env == "prod")` в коде.
+
+  - **4. Backing services (backing-сервисы)**
+    - БД, очереди, кэши, SMTP, внешние API — рассматривать как **подключаемые ресурсы**.
+    - Менять их **без изменения кода**: через URL/креды в env.
+    - Локальная БД и managed RDS — для приложения **одно и то же**, меняется только конфиг.
+    - Антипаттерн: захардкоженный `localhost:5432`, код, знающий про конкретный сервис.
+
+  - **5. Build, release, run (сборка, релиз, запуск)**
+    - Строгое разделение трёх стадий:
+      - **Build** — сборка артефакта (образ, бинарь) из кода.
+      - **Release** — build + config = релиз, неизменяемый.
+      - **Run** — запуск релиза в среде.
+    - **Нельзя менять код на стадии run** — только пересобрать и сделать новый релиз.
+    - В K8s: build → образ с digest → deploy → run.
+    - Антипаттерн: `git pull` на проде, правка файлов руками, «горячие фиксы» на сервере.
+
+  - **6. Processes (процессы)**
+    - Приложение — **один или несколько stateless-процессов**.
+    - **Stateless**: нет состояния в памяти/на диске между запросами.
+    - Состояние — в **backing services** (БД, Redis, S3).
+    - Процессы можно **убить и пересоздать** в любой момент.
+    - Горизонтальное масштабирование — простое (больше реплик).
+    - Антипаттерн: sticky sessions, локальный кэш в памяти, файлы на диске контейнера.
+
+  - **7. Port binding (привязка к порту)**
+    - Приложение **само слушает порт** и **экспортирует себя** как сервис.
+    - Не полагаться на внешний веб-сервер (Apache/nginx) для «запуска» приложения.
+    - В K8s: контейнер слушает порт → `Service` → `Ingress`.
+    - Антипаттерн: приложение отдаёт CGI-скрипты, зависимость от mod_php.
+
+  - **8. Concurrency (параллелизм)**
+    - Масштабирование через **процессы** (горизонтально), а не только через потоки в одном процессе.
+    - Разные типы нагрузки — разные процессы: web, worker, scheduler.
+    - В K8s: разные `Deployment` для web и worker, HPA для автоскейлинга.
+    - Антипаттерн: один процесс на всё, монолит, который нельзя масштабировать частично.
+
+  - **9. Disposability (одноразовость)**
+    - Процессы **быстро стартуют** и **корректно завершаются** (graceful shutdown).
+    - Обрабатывать **SIGTERM**: доработать текущие запросы, закрыть соединения, отпустить ресурсы.
+    - Быстрый старт — для автоскейлинга и canary.
+    - **Устойчивость к внезапному kill** (SIGKILL) — не терять данные.
+    - В K8s: `terminationGracePeriodSeconds`, `preStop` hook, exec-форма `CMD`.
+    - Антипаттерн: долгий старт (миграции в entrypoint), игнорирование SIGTERM, потеря данных при kill.
+
+  - **10. Dev/prod parity (паритет сред)**
+    - **Dev, staging, prod максимально похожи**: одинаковый стек, версии, backing services.
+    - **Минимизировать разрывы**: time gap (деплой раз в неделю vs каждый день), personnel gap (разработчики vs ops), tools gap (SQLite vs PostgreSQL).
+    - В K8s: одинаковый образ во всех средах, разные ConfigMap/Secret.
+    - Антипаттерн: SQLite в dev, PostgreSQL в prod; разные версии языка.
+    - 12-factor: «the twelve-factor app is designed for continuous deployment by keeping the gap between development and production small».
+
+  - **11. Logs (логи)**
+    - Логи — **поток событий** в **stdout/stderr**, не файлы.
+    - Приложение **не управляет** логами: не ротирует, не архивирует, не пишет в файл.
+    - Сборщик (Fluent Bit, Filebeat, Loki promtail) читает stdout и отправляет в централизованное хранилище (ELK, Loki, CloudWatch).
+    - В K8s: `kubectl logs`, logging-агент как DaemonSet.
+    - Антипаттерн: `log4j` в файл, ротация внутри приложения, `> /var/log/app.log`.
+
+  - **12. Admin processes (административные процессы)**
+    - Одноразовые админ-задачи (миграции, бэкапы, консоль) — **как отдельные процессы**, не как часть основного приложения.
+    - Тот же код, тот же образ, та же среда.
+    - В K8s: `Job`, `CronJob`, `kubectl exec` для отладки, миграции через `initContainer` или отдельный Job.
+    - Антипаттерн: миграции в entrypoint (долгий старт, race conditions), админ-скрипты «на сервере».
+
+- Плюсы 12-factor
+  - **Переносимость**: одинаково работает локально, в облаке, on-prem.
+  - **Масштабируемость**: stateless-процессы легко масштабировать.
+  - **Быстрый деплой**: build → release → run, immutable артефакты.
+  - **Dev/prod parity**: меньше «работает у меня локально».
+  - **Наблюдаемость**: логи в stdout, метрики, трейсы.
+  - **Устойчивость**: graceful shutdown, disposability.
+  - **Совместимость с cloud-native**: Docker, K8s, CI/CD, GitOps.
+  - **Командная работа**: единые соглашения, меньше сюрпризов.
+
+- Минусы и ограничения
+  - **Не про data**: 12-factor не покрывает stateful-сервисы (БД, Kafka), миграции данных, бэкапы.
+  - **Не про безопасность**: нет явных принципов про auth, secrets management, supply chain security.
+  - **Не про observability**: только логи в stdout, нет метрик/трейсов (Beyond 12-factor добавляет).
+  - **Не про API**: нет про API-first, versioning, contracts.
+  - **Stateless — не всегда**: stateful-приложения (БД, игровые серверы) плохо ложатся.
+  - **Монолиты тоже могут быть 12-factor**: это не только про микросервисы.
+  - **Не догма**: некоторые принципы устарели или требуют адаптации (например, «port binding» в serverless).
+
+- 12-factor и Kubernetes — как ложится
+  | Фактор | В K8s |
+  |---|---|
+  | Codebase | Git + ArgoCD/Flux (GitOps) |
+  | Dependencies | Docker-образ, lock-файлы |
+  | Config | ConfigMap, Secret, env |
+  | Backing services | Service, ExternalName, managed DB |
+  | Build/release/run | CI build → image digest → deploy |
+  | Processes | stateless Pods, Deployment |
+  | Port binding | containerPort + Service + Ingress |
+  | Concurrency | HPA, несколько Deployment (web/worker) |
+  | Disposability | terminationGracePeriodSeconds, preStop, exec CMD |
+  | Dev/prod parity | один образ, разные values/overlays |
+  | Logs | stdout → Fluent Bit → Loki/ELK |
+  | Admin processes | Job, CronJob |
+
+- 12-factor vs другие методологии
+  - **Beyond 12-factor** — добавляет **API-first**, **telemetry** (метрики, трейсы), **authentication/authorization**.
+  - **15-factor app** — расширение: API-first, telemetry, auth.
+  - **12-factor для data** — dataops, версионирование данных, воспроизводимость.
+  - **Cloud Native** (CNCF) — шире: контейнеры, оркестрация, service mesh, observability.
+  - **12-factor** — про **приложение**, cloud-native — про **всю экосистему**.
+
+- Типичные вопросы на собеседовании
+  - **«Что такое 12-factor app?»** — Методология из 12 принципов для cloud-native приложений: codebase, dependencies, config, backing services, build/release/run, processes, port binding, concurrency, disposability, dev/prod parity, logs, admin processes.
+  - **«Какой фактор нарушается, если приложение пишет логи в файл?»** — Фактор 11 (Logs): логи должны быть потоком в stdout/stderr, приложение не управляет ими.
+  - **«Почему конфигурация в env, а не в коде?»** — Фактор 3 (Config): один образ — разные окружения, без пересборки; секреты не в Git.
+  - **«Почему приложение должно быть stateless?»** — Фактор 6 (Processes): stateless-процессы можно убить и пересоздать, легко масштабировать; состояние — в backing services.
+  - **«Что такое graceful shutdown и зачем?»** — Фактор 9 (Disposability): обработка SIGTERM, доработать запросы, закрыть соединения. В K8s — `terminationGracePeriodSeconds`, `preStop`.
+  - **«Почему dev и prod должны быть похожи?»** — Фактор 10 (Dev/prod parity): меньше «работает у меня локально», одинаковый стек и версии.
+  - **«Как 12-factor relates to Docker/K8s?»** — Docker решает dependencies/port binding, K8s — config (ConfigMap/Secret), processes (stateless Pods), concurrency (HPA), disposability (graceful shutdown), logs (stdout → сборщик).
+  - **«Чего не хватает в 12-factor?»** — Security, observability (метрики, трейсы), API-first, data management — Beyond 12-factor / 15-factor.
+  - **«Может ли монолит быть 12-factor?»** — Да, 12-factor не про микросервисы, а про практики.
+  - **«Почему миграции не в entrypoint?»** — Фактор 12 (Admin processes): миграции — отдельный процесс (Job), иначе долгий старт, race conditions при нескольких репликах.
+
+- Короткий ответ на собеседовании
+  - 12-factor app — это методология из 12 принципов для cloud-native приложений, сформулированная в Heroku в 2011 году. Принципы: одна кодовая база — много деплоев (codebase); явные изолированные зависимости (dependencies); конфигурация в env, а не в коде (config); backing services как подключаемые ресурсы (backing services); строгое разделение build/release/run (build, release, run); stateless-процессы (processes); приложение само слушает порт (port binding); масштабирование через процессы (concurrency); быстро стартует и корректно завершается по SIGTERM (disposability); dev/stage/prod максимально похожи (dev/prod parity); логи — поток в stdout/stderr (logs); админ-задачи — отдельные процессы (admin processes). Хорошо ложится на Docker/K8s: ConfigMap/Secret для config, stateless Pods для processes, HPA для concurrency, terminationGracePeriodSeconds для disposability, Fluent Bit для logs, Job для admin processes. Ограничения: не про security, observability (метрики/трейсы), API-first, data management — это Beyond 12-factor / 15-factor. 12-factor не про микросервисы — монолит тоже может быть 12-factor.
+
+- Что запомнить железно
+  - **12 принципов**, Heroku, 2011, cloud-native.
+  - **Codebase** — одна база, много деплоев.
+  - **Dependencies** — явные, изолированные, lock-файлы.
+  - **Config** — в env, не в коде.
+  - **Backing services** — подключаемые ресурсы (БД, очереди, API).
+  - **Build/release/run** — строгое разделение, immutable релизы.
+  - **Processes** — stateless, состояние в backing services.
+  - **Port binding** — приложение само слушает порт.
+  - **Concurrency** — масштабирование через процессы.
+  - **Disposability** — быстрый старт, graceful shutdown по SIGTERM.
+  - **Dev/prod parity** — одинаковый стек, версии, backing services.
+  - **Logs** — поток в stdout/stderr, не файлы.
+  - **Admin processes** — отдельные процессы (Job, CronJob), не entrypoint.
+  - **В K8s**: ConfigMap/Secret, stateless Pods, HPA, terminationGracePeriodSeconds, Fluent Bit, Job.
+  - **Ограничения**: не про security, observability, API-first, data.
+  - **Beyond 12-factor / 15-factor** — добавляют API-first, telemetry, auth.
