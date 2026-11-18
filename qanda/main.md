@@ -936,88 +936,6 @@ make deploy IMG=yourrepo/namespace-labeler:tag
 
 ---
 
-# Kubernetes. Модель сети
-
-- Уровень 1: фундаментальная модель сети подов
-  - **Каждый под получает уникальный IP в кластере** — плоская сеть, без NAT между подами.
-  - **Все контейнеры внутри пода делят один network namespace** — один IP, один localhost, общий порт-спейс.
-  - **IP, который видит контейнер, — тот же, что видят другие поды** — нет NAT между подами, нет «внутреннего» и «внешнего» IP пода.
-  - Под может общаться с любым другим подом **напрямую по IP**, без NAT, даже если они на разных нодах.
-  - Это требование к CNI: **flat network** — все поды видят друг друга так, будто они в одной L2-сети.
-  - **Важно:** это модель, а не «магия». Реализуется CNI-плагином (overlay, routing, eBPF).
-
-- Уровень 2: как это реализовано в Linux
-  - **Каждый под работает в своём network namespace** — не каждый процесс, как в заметке, а именно **под** (точнее, sandbox-контейнер пода). Процессы внутри одного контейнера делят netns, контейнеры внутри пода тоже делят один netns.
-  - **pause-контейнер (sandbox)** — служебный контейнер в каждом поде, который **держит network namespace открытым**. Если контейнер приложения упадёт и перезапустится, netns останется, IP не поменяется. Pause создаётся kubelet'ом через CRI (containerd/CRI-O).
-  - **veth-пара** — виртуальный Ethernet-кабель: один конец в netns пода, другой — в netns хоста (или в bridge/overlay). Так под «подключается» к сети ноды.
-  - **Каждая нода получает свой CIDR** для подов (например, `10.244.1.0/24` на node-1, `10.244.2.0/24` на node-2). Под получает IP из диапазона своей ноды.
-  - **Маршрутизация между нодами** — задача CNI:
-    - **Overlay** (VXLAN, IP-in-IP) — пакет инкапсулируется, идёт по underlay-сети. Flannel (VXLAN), Calico (IP-in-IP), Weave.
-    - **Routing** (BGP) — ноды анонсируют CIDR друг другу, пакеты идут напрямую. Calico (BGP), Cilium (BGP).
-    - **eBPF** — Cilium, без iptables/kube-proxy для部分 сценариев.
-
-- Уровень 3: CNI (Container Network Interface)
-  - **CNI** — спецификация и набор плагинов, которые настраивают сеть пода: создают veth, назначают IP, настраивают маршруты, DNS.
-  - Kubelet вызывает CNI-плагин при создании/удалении пода.
-  - **Популярные CNI**:
-    - **Calico** — BGP или IP-in-IP, поддержка NetworkPolicy, eBPF-режим (Calico eBPF), часто choice для прода.
-    - **Cilium** — eBPF-based, L3/L4/L7 policy, observability (Hubble), замена kube-proxy, современный фаворит.
-    - **Flannel** — простой overlay (VXLAN), **не поддерживает NetworkPolicy**, хорош для простых кластеров.
-    - **Weave Net** — overlay, простой, но менее популярен сейчас.
-    - **Antrea** — на Open vSwitch, поддержка NetworkPolicy.
-    - **kubenet** — встроенный в kubelet, простой, но не для прода.
-  - **Flannel как DaemonSet** — да, обычно запускается как DaemonSet на каждой ноде, создаёт интерфейс `flannel.1` (VXLAN) или `cni0` (bridge).
-  - **Команда `kubectl describe configmaps kube-flannel-cfg -A`** — устаревшая, в современных версиях Flannel конфиг лежит иначе (в Secret/ConfigMap с другим именем, зависит от манифеста). В новых установках смотреть `kubectl -n kube-flannel get cm,secret`.
-  - **Не путать:** CNI — только про сеть **подов**. Service — отдельный механизм, реализуется kube-proxy или CNI (Cilium eBPF).
-
-- Уровень 4: NetworkPolicy (изоляция между подами)
-  - **NetworkPolicy** — API-объект, описывающий, **какие поды** могут общаться с какими (по labels, namespace, портам, CIDR).
-  - Работает **только на L3/L4** (IP, порт, протокол), не на L7.
-  - **Требует поддержки CNI**: если CNI не поддерживает — политики **игнорируются** (молча, без ошибок).
-  - **Flannel — не поддерживает** NetworkPolicy (в классическом виде).
-  - **Calico, Cilium, Antrea, Weave (частично) — поддерживают**.
-  - Default deny — если политика `podSelector: {}` с `policyTypes: [Ingress, Egress]` — все поды в namespace изолированы, пока не разрешено явно.
-  - NetworkPolicy **не заменяет** RBAC или authentication — это сетевая изоляция.
-
-- Уровень 5: Service — доступ к подам (внутри и снаружи)
-  - **Service** — стабильный виртуальный IP (ClusterIP) + DNS-имя + балансировка на набор подов по selector.
-  - **Реализуется kube-proxy** (или CNI): iptables/IPVS-правила на каждой ноде делают DNAT на поды.
-  - **kube-proxy modes**:
-    - **iptables** — default, правила iptables, O(n) при большом числе сервисов.
-    - **IPVS** — быстрее и масштабируемее на больших кластерах (O(1) lookup), но требует модулей ядра.
-    - **nftables** — новый режим (K8s 1.29+), замена iptables.
-    - **userspace** — legacy, не использовать.
-  - **Cilium может заменить kube-proxy** полностью (eBPF), без iptables/IPVS.
-
-- Уровень 6: типы Service
-  - **ClusterIP** (default) — виртуальный IP, доступен **только внутри кластера**. Не «ClusterApi», как в заметке — **ClusterIP**.
-  - **NodePort** — открывает порт (30000–32767) на **каждой ноде**, трафик `NodeIP:NodePort` → Service → поды. Обращаться по адресам нод. Обычно используется как база для LoadBalancer или для dev.
-  - **LoadBalancer** — облачный LB (AWS NLB/ALB, GCP LB, Azure LB), один внешний IP, трафик идёт на ноды → Service → поды. **Дороже** (каждый LB = деньги), cloud-controller-manager следит за нодами.
-  - **ExternalName** — DNS CNAME на внешний сервис, без проксирования.
-  - **Headless** (`clusterIP: None`) — без виртуального IP, DNS возвращает IP подов напрямую. Для StatefulSet, gRPC, когда нужен прямой доступ к конкретным подам.
-
-- Уровень 7: Ingress (L7-доступ снаружи)
-  - **Ingress — не тип Service**, а отдельный ресурс L7-маршрутизации (host/path → Service).
-  - Требует **Ingress Controller** (ingress-nginx, Traefik, HAProxy, ALB Ingress Controller).
-  - Обычно работает поверх **NodePort** или **LoadBalancer** Service самого контроллера.
-  - Даёт: TLS termination, host/path routing, rewrite, rate limit, auth (через аннотации).
-  - **Ingress ≠ LoadBalancer**: Ingress — правило L7, LoadBalancer — тип Service L4.
-
-- Уровень 8: доступ к отдельному поду для отладки
-  - **`kubectl port-forward`** — туннель с локальной машины на под/сервис через API-сервер, **минуя Service и CNI**.
-  - `kubectl port-forward service/myservice 10000:80` — локальный порт 10000 → Service → под.
-  - `kubectl port-forward pod/mypod 8080:80` — напрямую на под.
-  - Только для отладки, **не для прода** (нет HA, нет балансировки, туннель через apiserver).
-
-- Уровень 9: HostNetwork (особый случай)
-  - **`hostNetwork: true`** — под использует **network namespace ноды**, а не свой.
-  - Под видит IP ноды, порты ноды, может занять порт на внешнем интерфейсе ноды.
-  - Используется для системных компонентов: CNI, kube-proxy, node-exporter, ingress-nginx (в некоторых режимах).
-  - **Опасно для приложений**: конфликты портов, нет изоляции, под привязан к ноде.
-  - Альтернатива — `hostPort` (порт на ноде → под), но тоже не рекомендуется для приложений.
-
----
-
 # Ingress
 
 - Что такое Ingress (важное различие)
@@ -1838,3 +1756,84 @@ make deploy IMG=yourrepo/namespace-labeler:tag
   - **HTTPS** = TCP handshake (1 RTT) + TLS handshake (TLS 1.2 — 2 RTT, TLS 1.3 — 1 RTT).
   - **QUIC** — handshake совмещён (1 RTT, 0-RTT), поверх UDP.
   - **`ss -tan state syn-recv`** — посмотреть half-open.
+
+---
+
+# Kubernetes. Фундаментальная модель сети подов
+
+- фундаментальная модель сети подов
+  - **Каждый под получает уникальный IP в кластере** — плоская сеть, без NAT между подами.
+  - **Все контейнеры внутри пода делят один network namespace** — один IP, один localhost, общий порт-спейс.
+  - **IP, который видит контейнер, — тот же, что видят другие поды** — нет NAT между подами, нет «внутреннего» и «внешнего» IP пода.
+  - Под может общаться с любым другим подом **напрямую по IP**, без NAT, даже если они на разных нодах.
+  - Это требование к CNI: **flat network** — все поды видят друг друга так, будто они в одной L2-сети.
+  - **Важно:** это модель, а не «магия». Реализуется CNI-плагином (overlay, routing, eBPF).
+
+- Уровень 2: как это реализовано в Linux
+  - **Каждый под работает в своём network namespace** — не каждый процесс, как в заметке, а именно **под** (точнее, sandbox-контейнер пода). Процессы внутри одного контейнера делят netns, контейнеры внутри пода тоже делят один netns.
+  - **pause-контейнер (sandbox)** — служебный контейнер в каждом поде, который **держит network namespace открытым**. Если контейнер приложения упадёт и перезапустится, netns останется, IP не поменяется. Pause создаётся kubelet'ом через CRI (containerd/CRI-O).
+  - **veth-пара** — виртуальный Ethernet-кабель: один конец в netns пода, другой — в netns хоста (или в bridge/overlay). Так под «подключается» к сети ноды.
+  - **Каждая нода получает свой CIDR** для подов (например, `10.244.1.0/24` на node-1, `10.244.2.0/24` на node-2). Под получает IP из диапазона своей ноды.
+  - **Маршрутизация между нодами** — задача CNI:
+    - **Overlay** (VXLAN, IP-in-IP) — пакет инкапсулируется, идёт по underlay-сети. Flannel (VXLAN), Calico (IP-in-IP), Weave.
+    - **Routing** (BGP) — ноды анонсируют CIDR друг другу, пакеты идут напрямую. Calico (BGP), Cilium (BGP).
+    - **eBPF** — Cilium, без iptables/kube-proxy для部分 сценариев.
+
+---
+
+# Kubernetes. CNI
+
+- **CNI** — спецификация и набор плагинов, которые настраивают сеть пода: создают veth, назначают IP, настраивают маршруты, DNS.
+- Kubelet вызывает CNI-плагин при создании/удалении пода.
+- **Популярные CNI**:
+  - **Calico** — BGP или IP-in-IP, поддержка NetworkPolicy, eBPF-режим (Calico eBPF), часто choice для прода.
+  - **Cilium** — eBPF-based, L3/L4/L7 policy, observability (Hubble), замена kube-proxy, современный фаворит.
+  - **Flannel** — простой overlay (VXLAN), **не поддерживает NetworkPolicy**, хорош для простых кластеров.
+  - **Weave Net** — overlay, простой, но менее популярен сейчас.
+  - **Antrea** — на Open vSwitch, поддержка NetworkPolicy.
+  - **kubenet** — встроенный в kubelet, простой, но не для прода.
+- **Flannel как DaemonSet** — да, обычно запускается как DaemonSet на каждой ноде, создаёт интерфейс `flannel.1` (VXLAN) или `cni0` (bridge).
+- **Команда `kubectl describe configmaps kube-flannel-cfg -A`** — устаревшая, в современных версиях Flannel конфиг лежит иначе (в Secret/ConfigMap с другим именем, зависит от манифеста). В новых установках смотреть `kubectl -n kube-flannel get cm,secret`.
+- **Не путать:** CNI — только про сеть **подов**. Service — отдельный механизм, реализуется kube-proxy или CNI (Cilium eBPF).
+
+---
+
+# Kubernetes. NetworkPolicy
+- **NetworkPolicy** — API-объект, описывающий, **какие поды** могут общаться с какими (по labels, namespace, портам, CIDR).
+- Работает **только на L3/L4** (IP, порт, протокол), не на L7.
+- **Требует поддержки CNI**: если CNI не поддерживает — политики **игнорируются** (молча, без ошибок).
+- **Flannel — не поддерживает** NetworkPolicy (в классическом виде).
+- **Calico, Cilium, Antrea, Weave (частично) — поддерживают**.
+- Default deny — если политика `podSelector: {}` с `policyTypes: [Ingress, Egress]` — все поды в namespace изолированы, пока не разрешено явно.
+- NetworkPolicy **не заменяет** RBAC или authentication — это сетевая изоляция.
+
+---
+
+# Kubernetes. Service
+
+- Что это:
+  - Объект API предоставляющий сетевой доступ к подам (внутри и снаружи)
+  - **Service** — стабильный виртуальный IP (ClusterIP) + DNS-имя + балансировка на набор подов по selector.
+  - **Реализуется kube-proxy** (или CNI): iptables/IPVS-правила на каждой ноде делают DNAT на поды.
+  - **kube-proxy modes**:
+    - **iptables** — default, правила iptables, O(n) при большом числе сервисов.
+    - **IPVS** — быстрее и масштабируемее на больших кластерах (O(1) lookup), но требует модулей ядра.
+    - **nftables** — новый режим (K8s 1.29+), замена iptables.
+    - **userspace** — legacy, не использовать.
+  - **Cilium может заменить kube-proxy** полностью (eBPF), без iptables/IPVS.
+
+- Типы Service
+  - **ClusterIP** (default) — виртуальный IP, доступен **только внутри кластера**. Не «ClusterApi», как в заметке — **ClusterIP**.
+  - **NodePort** — открывает порт (30000–32767) на **каждой ноде**, трафик `NodeIP:NodePort` → Service → поды. Обращаться по адресам нод. Обычно используется как база для LoadBalancer или для dev.
+  - **LoadBalancer** — облачный LB (AWS NLB/ALB, GCP LB, Azure LB), один внешний IP, трафик идёт на ноды → Service → поды. **Дороже** (каждый LB = деньги), cloud-controller-manager следит за нодами.
+  - **ExternalName** — DNS CNAME на внешний сервис, без проксирования.
+  - **Headless** (`clusterIP: None`) — без виртуального IP, DNS возвращает IP подов напрямую. Для StatefulSet, gRPC, когда нужен прямой доступ к конкретным подам.
+
+---
+
+# Что делает kubectl port-forward?
+- Уровень 8: доступ к отдельному поду для отладки
+  - **`kubectl port-forward`** — туннель с локальной машины на под/сервис через API-сервер, **минуя Service и CNI**.
+  - `kubectl port-forward service/myservice 10000:80` — локальный порт 10000 → Service → под.
+  - `kubectl port-forward pod/mypod 8080:80` — напрямую на под.
+  - Только для отладки, **не для прода** (нет HA, нет балансировки, туннель через apiserver).
