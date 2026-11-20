@@ -4,4 +4,4 @@
 - ELK
 - Ansible в declarative режиме
 - Чем отличается L2-сеть от L3-сети?
-- ResourceQuota
+- LimitRange
