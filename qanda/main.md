@@ -1658,9 +1658,10 @@ make deploy IMG=yourrepo/namespace-labeler:tag
 
 ---
 
-# BGP (Border Gateway Protocol)
+# Что такое BGP?
 
 - Что это
+  - Border Gateway Protocol 
   - **Протокол маршрутизации между автономными системами** (Exterior Gateway Protocol, EGP). Де-факто стандарт для интернета.
   - **Path-vector** протокол: каждый анонс несёт **полный список AS**, через которые прошёл префикс. Это позволяет обнаруживать петли и применять политики.
   - Работает **поверх TCP, порт 179**. Это даёт надёжную доставку, инкрементальные обновления (не periodic refresh), keepalive. Минус — congestion control на протоколе маршрутизации может мешать при перегрузке.
