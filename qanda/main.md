@@ -2833,3 +2833,247 @@ Keepalived работает как единый демон, реализующи
 Keepalived — это проверенный временем и очень гибкий инструмент. Он идеально подходит для создания отказоустойчивых шлюзов и балансировщиков в традиционных инфраструктурах и на bare-metal серверах. В контексте Kubernetes его основная ниша — обеспечение высокой доступности control-plane и создание точки входа в кластер, хотя для управления жизненным циклом Service в K8s существуют и более «родные» инструменты.
 
 Если захотите углубиться в какой-то из аспектов, например, в настройку `keepalived.conf` или сравнение с `kube-vip`, дайте знать.
+
+---
+
+# CNI (Container Network Interface)
+
+CNI — это **спецификация и набор плагинов** для настройки сети контейнеров в Linux. Когда kubelet создаёт под, он не «знает», как назначить IP, создать veth-пару, настроить маршруты и DNS — он делегирует это CNI-плагину. CNI — это **не один инструмент**, а **стандарт интерфейса** между оркестратором (Kubernetes, containerd, CRI-O, Podman) и сетевым плагином (Calico, Cilium, Flannel). Без CNI поды не получат IP и не смогут общаться. Важно не путать: **CNI — это про сеть подов** (L3/L4), а **Service и Ingress** — отдельные механизмы (kube-proxy, Ingress Controller), хотя Cilium умеет заменять и их.
+
+- Что это
+  - **Спецификация** (CNI spec, github.com/containernetworking/cni) — набор правил, как оркестратор вызывает плагин.
+  - **Набор плагинов** — бинарники в `/opt/cni/bin/`, которые реализуют spec.
+  - **Не демон и не сервис** — плагин вызывается **по требованию** (exec) при создании/удалении пода.
+  - **Ответственность**: назначить IP поду, создать veth-пару, настроить маршруты, bridge, DNS, политики (если плагин умеет).
+  - **Не отвечает** за: Service (ClusterIP), Ingress, NetworkPolicy (хотя многие CNI умеют), DNS (CoreDNS).
+  - Спецификация: **CNI spec v1.0+** (стабильная), до этого 0.4.0.
+
+- Зачем нужен
+  - **Единый интерфейс**: kubelet не знает, какой CNI установлен — он вызывает плагин по спецификации.
+  - **Плоская сеть подов**: каждый под получает уникальный IP, общается с любым подом без NAT.
+  - **Сменяемость**: можно заменить Flannel на Calico или Cilium, не меняя Kubernetes.
+  - **Разные сценарии**: overlay (VXLAN), routing (BGP), eBPF, cloud-native (AWS VPC CNI, Azure CNI).
+  - **Расширяемость**: NetworkPolicy, encryption (WireGuard, IPsec), observability (Hubble в Cilium).
+
+- Как работает (пошагово)
+  1. Kubelet создаёт sandbox-контейнер (pause) и **network namespace** для пода.
+  2. Kubelet читает конфиг CNI (`/etc/cni/net.d/*.conf`) — какой плагин использовать.
+  3. Kubelet вызывает **CNI-бинарник** (`/opt/cni/bin/<plugin>`) с командами `ADD`, `DEL`, `CHECK`.
+  4. Плагин через stdin получает JSON с параметрами: netns, имя интерфейса, IPAM-конфиг.
+  5. Плагин:
+     - создаёт **veth-пару** (один конец в netns пода, другой — в netns хоста или bridge);
+     - через **IPAM-плагин** (`host-local`, `dhcp`, `calico-ipam`, `cilium`) выделяет IP;
+     - настраивает маршруты, DNS (`/etc/resolv.conf`), bridge, iptables/nftables/eBPF.
+  6. Плагин возвращает JSON с результатом: IP, MAC, gateway, DNS.
+  7. Kubelet записывает результат в `Pod.status` (podIP).
+  8. При удалении пода — `DEL` — плагин убирает интерфейсы, освобождает IP.
+
+- Команды CNI (что вызывает kubelet)
+  - **`ADD`** — создать сеть для пода, назначить IP.
+  - **`DEL`** — удалить сеть, освободить IP.
+  - **`CHECK`** — проверить состояние сети (опционально, CNI 0.4+).
+  - **`GC`** — сборка мусора (CNI 1.0+, опционально).
+  - **`VERSION`** — версия spec.
+
+- Конфигурация CNI
+  - **`/etc/cni/net.d/`** — конфиги (kubelet читает первый по алфавиту).
+  - **`/opt/cni/bin/`** — бинарники плагинов.
+  - **`/var/lib/cni/`** — состояние (IPAM, кэш).
+  - **`/var/lib/calico/`, `/var/run/cilium/`** — состояние конкретных CNI.
+  - Пример конфига (упрощённо):
+    ```json
+    {
+      "cniVersion": "1.0.0",
+      "name": "mynet",
+      "type": "calico",
+      "ipam": { "type": "calico-ipam" }
+    }
+    ```
+
+- IPAM (IP Address Management)
+  - **Что это**: подсистема, которая выделяет IP подам из пула.
+  - **Плагины**:
+    - **`host-local`** — простой, хранит состояние в файлах на ноде, статический пул.
+    - **`dhcp`** — запрашивает IP по DHCP.
+    - **`calico-ipam`** — выделяет из IP-пулов Calico (IPPool), поддерживает блоки на ноду.
+    - **`cilium`** — свой IPAM (cluster-pool, kubernetes, multi-pool, ENI).
+    - **`whereabouts`** — cluster-wide IPAM для multi-node (часто с Flannel/Multus).
+  - **CIDR на ноду**: каждая нода получает свой **pod CIDR** (например, `/24` из `10.244.0.0/16`), из него выделяются IP подам.
+  - **`--pod-network-cidr`** в `kubeadm init` — задаёт общий пул.
+
+- Виды CNI по реализации
+
+  - **Overlay (VXLAN, IP-in-IP)**
+    - **Как работает**: пакет инкапсулируется в UDP/IP и идёт по underlay-сети. Ноды не обязаны быть в одном L2.
+    - **Плюсы**: работает везде, не требует BGP, простой.
+    - **Минусы**: overhead (инкапсуляция), MTU ниже (обычно 1450 вместо 1500), latency.
+    - **Примеры**: **Flannel (VXLAN)**, **Weave Net**, **Calico (IP-in-IP, VXLAN)**, **Cilium (VXLAN, Geneve)**.
+
+  - **Routing (BGP)**
+    - **Как работает**: ноды анонсируют свои pod CIDR через BGP, пакеты идут напрямую без инкапсуляции.
+    - **Плюсы**: нативная производительность, нет overhead, MTU 1500.
+    - **Минусы**: требует поддержки BGP в сети (ToR-роутеры), сложнее в настройке.
+    - **Примеры**: **Calico (BGP)**, **Cilium (BGP)**, **MetalLB (BGP)**.
+
+  - **eBPF-based**
+    - **Как работает**: eBPF-программы в ядре заменяют iptables/kube-proxy, обрабатывают пакеты быстрее, дают L7-observability.
+    - **Плюсы**: производительность, L7 policy, observability (Hubble), замена kube-proxy.
+    - **Минусы**: требует ядра 4.19+/5.x+, сложнее в отладке.
+    - **Примеры**: **Cilium** (лидер), **Calico eBPF mode**.
+
+  - **Cloud-native**
+    - **Как работает**: CNI интегрируется с облачной сетью (VPC, ENI, IPAM облака).
+    - **Плюсы**: нативная производительность, интеграция с security groups, VPC routing.
+    - **Минусы**: vendor lock-in, лимиты облака (кол-во ENI, IP).
+    - **Примеры**: **AWS VPC CNI** (по ENI на под), **Azure CNI**, **GKE CNI**.
+
+  - **Host-local / bridge**
+    - **Как работает**: bridge + host-local IPAM, простой.
+    - **Плюсы**: просто, без зависимостей.
+    - **Минусы**: только single-node, не для прода.
+    - **Примеры**: **bridge**, **macvlan**, **host-device** (стандартные плагины).
+
+- Популярные CNI-плагины
+
+  - **Calico**
+    - BGP или IP-in-IP/VXLAN, eBPF-режим.
+    - **NetworkPolicy** — да (полноценно).
+    - **Encryption** — WireGuard.
+    - Используется в проде, enterprise-поддержка (Tigera).
+    - Хорош для on-prem и cloud.
+
+  - **Cilium**
+    - eBPF-based, замена kube-proxy, L3/L4/L7 policy.
+    - **NetworkPolicy** — да, плюс CiliumNetworkPolicy (L7: HTTP, Kafka, gRPC).
+    - **Observability** — Hubble (UI, метрики, трейсы).
+    - **Encryption** — WireGuard, IPsec.
+    - **BGP** — да (с 1.13+), может заменить MetalLB.
+    - Современный фаворит, CNCF Graduated.
+
+  - **Flannel**
+    - Простой overlay (VXLAN), host-local IPAM.
+    - **NetworkPolicy — НЕТ** (в классическом виде).
+    - **Encryption — нет** (кроме WireGuard-варианта).
+    - Для простых кластеров, где не нужна изоляция.
+
+  - **Weave Net**
+    - Overlay, простой, но менее популярен сейчас.
+    - NetworkPolicy — частично.
+    - Проект фактически в maintenance mode.
+
+  - **Antrea**
+    - На Open vSwitch, NetworkPolicy, Windows-поддержка.
+    - Разработка VMware.
+
+  - **kubenet**
+    - Встроенный в kubelet, простой bridge + host-local.
+    - Не для прода (нет NetworkPolicy, нет overlay между нодами).
+
+  - **Multus**
+    - **Мета-плагин**: позволяет поду иметь **несколько сетевых интерфейсов** (например, management + data + storage).
+    - Используется в NFV, telco, ML (RDMA), где нужны multiple networks.
+
+  - **AWS VPC CNI**
+    - Каждый под получает **ENI** (или secondary IP) из VPC.
+    - Нативная производительность, но лимиты на кол-во ENI/IP на инстанс.
+    - NetworkPolicy — только с Calico поверх (или VPC CNI network policy, с 1.20+).
+
+- CNI и NetworkPolicy
+  - **NetworkPolicy** — API-объект, но **реализует его CNI**.
+  - **Поддерживают**: Calico, Cilium, Antrea, Weave (частично), AWS VPC CNI (с 1.20+).
+  - **Не поддерживают**: Flannel (в классическом виде), kubenet.
+  - Если CNI не поддерживает — политики **молча игнорируются** (опасная иллюзия безопасности).
+  - Для L7 policy (HTTP-методы, пути) — только **Cilium** (CiliumNetworkPolicy).
+
+- CNI и Service / kube-proxy
+  - **CNI — про сеть подов** (L3/L4), **Service** — отдельный механизм (kube-proxy, iptables/IPVS).
+  - **Cilium** может **заменить kube-proxy** полностью (eBPF), обрабатывая Service без iptables.
+  - **Calico** в eBPF-режиме тоже может заменить kube-proxy (с 3.13+).
+  - **Ingress** — отдельный слой (Ingress Controller), работает поверх Service.
+
+- CNI и Service Mesh
+  - **Service mesh** (Istio, Linkerd) — sidecar-прокси, работают **поверх** CNI.
+  - **Cilium Service Mesh** — sidecar-less, на eBPF, встроен в CNI.
+  - **Istio ambient mode** — ztunnel (L4) на ноде + waypoint (L7), тоже без sidecar.
+  - CNI и mesh — **разные слои**, но пересекаются в eBPF-решениях.
+
+- Плюсы CNI как подхода
+  - **Стандарт**: единый интерфейс, сменяемость плагинов.
+  - **Гибкость**: overlay, routing, eBPF, cloud-native — под разные задачи.
+  - **Расширяемость**: NetworkPolicy, encryption, observability, multi-network (Multus).
+  - **Экосистема**: Calico, Cilium, Flannel — зрелые, проверенные в проде.
+  - **Не привязан к Kubernetes**: работает с Podman, containerd, Nomad.
+
+- Минусы и подводные камни
+  - **Не все CNI одинаковы**: Flannel без NetworkPolicy — частая ошибка (думают, что изоляция есть).
+  - **MTU**: overlay уменьшает MTU (1450 вместо 1500), забыли — фрагментация, странные ошибки.
+  - **BGP требует инфраструктуры**: ToR-роутеры должны поддерживать BGP, иначе routing не работает.
+  - **eBPF требует ядра**: 4.19+/5.x+, не на всех дистрибутивах и managed-кластерах.
+  - **Лимиты облака**: AWS VPC CNI ограничен ENI/IP на инстанс.
+  - **Отладка**: `tcpdump`, `ip`, `ss` внутри netns пода — нужно уметь (`nsenter`, `kubectl debug`).
+  - **Смена CNI**: нетривиально, часто требует пересоздания кластера или простоя.
+  - **Производительность**: overlay медленнее routing/eBPF, eBPF — самый быстрый.
+  - **IPAM-конфликты**: неправильный CIDR → пересечение с VPC или другими сетями.
+  - **`hostNetwork: true`** — поды вне CNI, не управляются NetworkPolicy.
+
+- Отладка CNI
+  ```bash
+  # Конфиги CNI
+  ls /etc/cni/net.d/
+  cat /etc/cni/net.d/*.conf
+
+  # Бинарники
+  ls /opt/cni/bin/
+
+  # Pod IP и интерфейсы
+  kubectl get pod <pod> -o wide
+  kubectl exec <pod> -- ip a
+  kubectl exec <pod> -- ip route
+
+  # В netns пода (если в образе нет утилит)
+  nsenter -t <pid> -n ip a
+  nsenter -t <pid> -n ss -tulpn
+
+  # На ноде
+  ip a | grep -E 'cni|veth|cali|cilium|flannel'
+  ip route
+  iptables -t nat -L -n -v   # или nft list ruleset
+
+  # Логи CNI
+  kubectl logs -n kube-system <cni-pod>
+  journalctl -u kubelet | grep -i cni
+
+  # Проверить CNI вручную (осторожно)
+  CNI_COMMAND=ADD CNI_CONTAINERID=test CNI_NETNS=/var/run/netns/test \
+    CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin /opt/cni/bin/calico < config.json
+  ```
+
+- Частые вопросы на собеседовании
+  - **«Что такое CNI?»** — Спецификация и набор плагинов для настройки сети подов. Kubelet вызывает плагин (ADD/DEL/CHECK) при создании/удалении пода.
+  - **«CNI — это демон?»** — Нет, плагин вызывается по требованию (exec), не работает постоянно. Демоны есть у конкретных CNI (calico-node, cilium-agent) — они управляют состоянием, но сам CNI-вызов — exec.
+  - **«Что делает CNI при создании пода?»** — Создаёт veth-пару, назначает IP через IPAM, настраивает маршруты, bridge, DNS, возвращает результат kubelet.
+  - **«Calico vs Cilium vs Flannel?»** — Flannel — простой overlay, без NetworkPolicy. Calico — BGP/eBPF, NetworkPolicy, encryption. Cilium — eBPF, L7 policy, observability (Hubble), замена kube-proxy, BGP.
+  - **«Кто реализует NetworkPolicy?»** — CNI. Flannel — не поддерживает, Calico/Cilium/Antrea — поддерживают. Если CNI не умеет — политики игнорируются.
+  - **«Что такое IPAM?»** — Подсистема выделения IP подам: host-local, dhcp, calico-ipam, cilium, whereabouts.
+  - **«Как поды общаются между нодами?»** — Overlay (VXLAN/IP-in-IP), routing (BGP), или eBPF. Каждая нода имеет свой pod CIDR.
+  - **«Что такое Multus?»** — Мета-CNI для нескольких сетевых интерфейсов в поде (NFV, telco, ML).
+  - **«Может ли CNI заменить kube-proxy?»** — Да, Cilium (eBPF) и Calico (eBPF mode) могут.
+  - **«Как отладить сеть пода?»** — `kubectl exec` + `ip`/`ss`, `nsenter`, `kubectl debug`, `tcpdump` на ноде, логи CNI.
+  - **«Что такое MTU в overlay и почему важен?»** — Инкапсуляция уменьшает MTU (1450 вместо 1500), неправильный MTU → фрагментация и странные ошибки.
+
+- Короткий ответ на собеседовании
+  - CNI (Container Network Interface) — это спецификация и набор плагинов для настройки сети контейнеров в Linux. Когда kubelet создаёт под, он создаёт network namespace (pause-контейнер) и вызывает CNI-плагин командами ADD/DEL/CHECK, передавая JSON с параметрами. Плагин создаёт veth-пару, через IPAM выделяет IP, настраивает маршруты, bridge, DNS, возвращает результат. CNI отвечает только за сеть подов (L3/L4) — плоская сеть, каждый под с уникальным IP, без NAT. Service (kube-proxy), Ingress, DNS — отдельные механизмы, хотя Cilium умеет заменять kube-proxy. Популярные CNI: Calico (BGP/eBPF, NetworkPolicy, encryption), Cilium (eBPF, L7 policy, Hubble, замена kube-proxy), Flannel (простой overlay, **без NetworkPolicy**), Weave, Antrea, AWS VPC CNI (cloud-native), Multus (multi-network). NetworkPolicy реализуется CNI: если CNI не поддерживает — политики молча игнорируются. Виды: overlay (VXLAN, overhead, MTU 1450), routing (BGP, нативно), eBPF (Cilium, быстро, L7), cloud-native (ENI, лимиты облака). Отладка: `kubectl exec` + `ip`/`ss`, `nsenter`, логи CNI, `tcpdump`.
+
+- Что запомнить железно
+  - **CNI — спецификация + плагины**, не демон; вызывается по требованию (ADD/DEL/CHECK).
+  - **Отвечает за сеть подов** (L3/L4), не за Service/Ingress/DNS.
+  - **Плоская сеть**: уникальный IP на под, без NAT между подами.
+  - **Каждая нода — свой pod CIDR**, маршрутизация — CNI.
+  - **IPAM** — выделение IP: host-local, calico-ipam, cilium, whereabouts.
+  - **NetworkPolicy реализует CNI**, Flannel — не поддерживает.
+  - **Calico** — BGP/eBPF, NetworkPolicy. **Cilium** — eBPF, L7, Hubble, замена kube-proxy. **Flannel** — простой, без policy.
+  - **Overlay (VXLAN)** — overhead, MTU 1450. **Routing (BGP)** — нативно. **eBPF** — быстро, L7.
+  - **Multus** — multi-network в поде.
+  - **`/etc/cni/net.d/`** — конфиги, **`/opt/cni/bin/`** — бинарники.
+  - **`nsenter -t <pid> -n`** — зайти в netns пода для отладки.
+  - **Cilium может заменить kube-proxy** (eBPF).
