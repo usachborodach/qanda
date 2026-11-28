@@ -7,6 +7,10 @@
 - ещё полистать Скилбокс
 - ещё полистать Крюкова
 
+# практика
+- насочинять собственных практических заданий
+- типа "поднять и протестировать работу истио в миникубе"
+
 # linux
 - https://github.com/Swfuse/devops-interview/blob/main/interview.md
 - https://sadservers.com/scenarios
